@@ -208,8 +208,7 @@ public class FirstPersonParticleSystem {
      * 移除所有发射器和粒子。
      */
     public void clear() {
-        mainEmitters.clear();
-        offEmitters.clear();
+        discardEmitters();
         hasPrevCam = false;
     }
 
@@ -221,6 +220,28 @@ public class FirstPersonParticleSystem {
         for (ParticleEmitterInstance emitter : emittersFor(hand)) {
             emitter.setRemoved(true);
         }
+    }
+
+    /**
+     * 立即废弃指定手的发射器及局部空间粒子。
+     * <p>
+     * 用于该手的第一人称模型不再有可用渲染基准的场景，例如收枪结束、物品被遮挡或
+     * 切换到第三人称。已投递到原版 ParticleEngine 的世界空间粒子不会受影响。
+     */
+    public void discardEmitters(InteractionHand hand) {
+        List<ParticleEmitterInstance> emitters = emittersFor(hand);
+        for (ParticleEmitterInstance emitter : emitters) {
+            emitter.discard();
+        }
+        emitters.clear();
+    }
+
+    /**
+     * 立即废弃主手和副手的全部第一人称发射器。
+     */
+    public void discardEmitters() {
+        discardEmitters(InteractionHand.MAIN_HAND);
+        discardEmitters(InteractionHand.OFF_HAND);
     }
 
     /**
