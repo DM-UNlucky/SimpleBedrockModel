@@ -19,6 +19,7 @@ import example.animation.TestBlockAnimationInstance;
 import example.block.blockentity.TestBlockEntity;
 import example.init.ExampleModRegister;
 import example.resource.KnownResources;
+import example.client.staticworld.ExampleStaticSource;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderer;
@@ -66,6 +67,12 @@ public class TreeTestBlockEntityRenderer implements BlockEntityRenderer<TestBloc
         boolean polyMeshTest = blockEntity.getBlockState().is(ExampleModRegister.POLY_MESH_TEST_BLOCK);
         TreeBedrockModel model = polyMeshTest ? polyMeshTestModelSupplier.get() : testModelSupplier.get();
         if (model == null) {
+            return;
+        }
+        // 静态路径开启时由 ExampleStaticSource 接管：这里只登记实例，绘制统一发生在 AFTER_BLOCK_ENTITIES。
+        if (ExampleStaticSource.tryEnqueue(blockEntity, packedLight, model,
+                polyMeshTest ? KnownResources.POLY_MESH_TEST : KnownResources.TEST,
+                polyMeshTest ? POLY_MESH_TEST_TEXTURE : TEST_TEXTURE)) {
             return;
         }
 

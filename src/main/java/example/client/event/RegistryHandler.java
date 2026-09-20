@@ -2,6 +2,8 @@ package example.client.event;
 
 import example.client.render.blockentity.TreeTestBlockEntityRenderer;
 import example.client.render.entity.ZtiRenderer;
+import example.client.staticworld.ExampleStaticSource;
+import example.client.staticworld.ExampleStressSource;
 import example.init.ExampleModRegister;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.EntityRenderersEvent;
@@ -14,5 +16,7 @@ public class RegistryHandler {
     public static void registerRenderers(EntityRenderersEvent.RegisterRenderers event) {
         event.registerBlockEntityRenderer(ExampleModRegister.TEST_BLOCK_ENTITY_TYPE, TreeTestBlockEntityRenderer::new);
         event.registerEntityRenderer(ExampleModRegister.ZTI_ENTITY_TYPE, ZtiRenderer::new);
+        ExampleStaticSource.register();
+        ExampleStressSource.register();
     }
 }
