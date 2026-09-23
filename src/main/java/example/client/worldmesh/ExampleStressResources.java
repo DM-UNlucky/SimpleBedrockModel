@@ -1,4 +1,4 @@
-package example.client.staticworld;
+package example.client.worldmesh;
 
 import com.github.mcmodderanchor.simplebedrockmodel.v2.event.RegisterV2BedrockResourcesEvent;
 import example.init.ExampleModRegister;

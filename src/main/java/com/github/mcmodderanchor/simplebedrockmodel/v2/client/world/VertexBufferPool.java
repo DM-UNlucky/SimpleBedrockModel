@@ -16,7 +16,7 @@ import java.util.Map;
  * <p>池只回收"整个 VertexBuffer"，不做子分配。所有方法都必须在渲染线程调用。</p>
  */
 @OnlyIn(Dist.CLIENT)
-final class VboPool {
+final class VertexBufferPool {
     private final Map<VertexFormat, ArrayDeque<VertexBuffer>> idle = new HashMap<>();
     private int created;
     private int reused;

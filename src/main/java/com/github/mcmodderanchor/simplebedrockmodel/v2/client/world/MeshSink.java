@@ -1,4 +1,4 @@
-package com.github.mcmodderanchor.simplebedrockmodel.v2.common.model.baked;
+package com.github.mcmodderanchor.simplebedrockmodel.v2.client.world;
 
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.VertexConsumer;
@@ -8,14 +8,15 @@ import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.api.distmarker.OnlyIn;
 
 /**
- * 打包顶点捕获（静态世界层的 L2 出口）：把 {@link VertexConsumer} 调用写进扁平数组，不触碰 GL 与
- * BufferBuilder，因此可以在任意线程烘焙，之后在渲染线程用 {@link #emitTo(VertexConsumer)} 回放。
+ * 打包顶点捕获：把 {@link VertexConsumer} 调用写进扁平数组，不触碰 GL 与
+ * BufferBuilder。同一个实例不可并发访问；后台烘焙须使用独立的模型状态。
+ * 回放线程要求由目标 {@link VertexConsumer} 决定。
  *
- * <p>顶点格式与 draw mode 由静态世界层钉死：{@link DefaultVertexFormat#NEW_ENTITY}（36 B/顶点），
+ * <p>顶点格式与 draw mode 由世界网格绘制层钉死：{@link DefaultVertexFormat#NEW_ENTITY}（36 B/顶点），
  * 只允许 {@link VertexFormat.Mode#QUADS} 与 {@link VertexFormat.Mode#TRIANGLES}。上层缓冲池按格式分桶，
  * 所以格式不能由调用方自带。</p>
  *
- * <p>法线约定：按<b>世界朝向</b>烘焙（只含模型自身的旋转，不含相机视图旋转）。静态世界层会用世界空间光源方向
+ * <p>世界网格绘制层的法线约定：按<b>世界朝向</b>烘焙（只含模型自身的旋转，不含相机视图旋转）。世界网格绘制层会用世界空间光源方向
  * 与之匹配；若把视图相关的内容烘进来，光照会随镜头变化。</p>
  */
 @OnlyIn(Dist.CLIENT)
@@ -114,7 +115,7 @@ public final class MeshSink implements VertexConsumer {
     }
 
     /**
-     * 光照运行段数量。静态层用它做"原地只改光照"的最小更新面：只重写跟随实例光照的顶点。
+     * 光照运行段数量。实例光照模式用它构造独立光照流，不改写几何缓冲。
      */
     public int lightRunCount() {
         this.flush();
@@ -136,13 +137,18 @@ public final class MeshSink implements VertexConsumer {
         return this.lightRunValues[index];
     }
 
-    /** 回放到任意 consumer（渲染线程）。 */
+    /** 回放到目标 consumer；线程约束由目标决定。 */
     public void emitTo(VertexConsumer out) {
+        emitTo(out, 0, 0, 0);
+    }
+
+    /** 以局部平移追加捕获结果；用于 section 拼接，不改变法线和光照模板。 */
+    public void emitTo(VertexConsumer out, double x, double y, double z) {
         this.flush();
         for (int i = 0; i < this.vertexCount; i++) {
             int p = i * 3;
             int t = i * 2;
-            out.vertex(this.positions[p], this.positions[p + 1], this.positions[p + 2])
+            out.vertex(this.positions[p] + x, this.positions[p + 1] + y, this.positions[p + 2] + z)
                     .color(this.colors[i])
                     .uv(this.uvs[t], this.uvs[t + 1])
                     .overlayCoords(this.overlays[i])

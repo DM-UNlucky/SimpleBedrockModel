@@ -138,6 +138,7 @@ dependencies {
 //
 //    runtimeOnly fg.deobf("dev.kosmx.player-anim:player-animation-lib-forge:1.0.2-rc1+1.20")
     runtimeOnly fg.deobf('libs:oculus:mc1.20.1-1.7.0')
+    runtimeOnly fg.deobf('curse.maven:rubidium-extra-654373:6101745')
 //    runtimeOnly fg.deobf("curse.maven:accelerated-rendering-1314021:7342975")
 
     compileOnly(annotationProcessor("io.github.llamalad7:mixinextras-common:0.3.6"))

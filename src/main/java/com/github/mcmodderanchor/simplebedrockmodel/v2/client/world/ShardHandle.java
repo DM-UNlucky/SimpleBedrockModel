@@ -1,89 +1,166 @@
 package com.github.mcmodderanchor.simplebedrockmodel.v2.client.world;
 
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.VertexBuffer;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import net.minecraft.client.renderer.RenderType;
+import net.minecraft.world.phys.AABB;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.api.distmarker.OnlyIn;
 
+import java.nio.ByteBuffer;
 import java.util.concurrent.CompletableFuture;
 
-/**
- * 库发出的缓冲句柄。实现方只需 retain / release，实际的上传、池化与回收由
- * {@link StaticWorldRenderer} 负责；释放必须经由本句柄，这就是"过期策略归实现方、释放动作必经库 API"的实现方式。
- */
+/** 一个 GPU 网格的内部所有权记录；共享引用只在 GeometryCache.Entry 计数，句柄只释放一次。 */
 @OnlyIn(Dist.CLIENT)
-public final class ShardHandle {
+final class ShardHandle {
+    /**
+     * 这个 shard 的光照怎么给。
+     *
+     * <ul>
+     *   <li>{@link LightMode#FIXED}：所有顶点都是烘焙时的实际光照→ attribute 4 直接读几何 buffer；</li>
+     *   <li>{@link LightMode#UNIFORM}：所有顶点都跟随实例光照 → 整个 draw 是同一个值，用"关闭 attribute 数组 +
+     *       整型常量属性"，不需要任何光照缓冲；</li>
+     *   <li>{@link LightMode#STREAM}：两者混合（部分 bone 满亮）→ 需要 4 B/顶点的光照缓冲。</li>
+     *   <li>{@link LightMode#MUTABLE}：实际光照独立存储，由调用方按顶点范围更新。</li>
+     * </ul>
+     */
+    enum LightMode {
+        FIXED,
+        UNIFORM,
+        STREAM,
+        MUTABLE
+    }
+
+    private static int nextId;
+
+    private final int id;
     private final String ownerId;
     private final VertexBuffer buffer;
     private final VertexFormat format;
-    private final ShardMeta meta;
-    private final double submitDistanceSq;
+    private final RenderType material;
+    private final AABB localBounds;
+    private final long generation;
     private final CompletableFuture<Void> upload;
-    private final int vertexCount;
     private final int[] lightRunStarts;
     private final int[] lightRunLengths;
     private final int[] lightRunValues;
+    /** 光照独立流；-1 表示无需额外缓冲（FIXED 或 UNIFORM）。 */
+    private final int lightBufferId;
+    /** 光照流的 CPU 暂存内容；STREAM 按模板更新，MUTABLE 按调用方指定范围更新。 */
+    private final ByteBuffer lightScratch;
+    private final LightMode lightMode;
+    private final LightRangeUpdates lightUpdates;
 
-    private int packedLight;
-    private int references = 1;
+    /** 光照缓冲当前内容对应的实例光照值；{@link Integer#MIN_VALUE} 表示还没写过。 */
+    private int lightValue = Integer.MIN_VALUE;
     private boolean retired;
     private boolean dead;
     private boolean recycled;
+    /**
+     * 本句柄的几何 VAO 上，attribute 4（UV2）是否已按本句柄的要求挂好。
+     *
+     * <p>几何上传（{@code VertexBuffer.upload} 在格式变化时会重新 setupBufferState）与池回收复用
+     * 都会让这个前置条件失效，所以标志必须挂在句柄上、初值为 false。</p>
+     */
+    private boolean lightStreamAttached;
 
-    ShardHandle(String ownerId, VertexBuffer buffer, VertexFormat format, int vertexCount, ShardMeta meta,
-                double submitDistanceSq, CompletableFuture<Void> upload,
-                int[] lightRunStarts, int[] lightRunLengths, int[] lightRunValues) {
+    ShardHandle(String ownerId, VertexBuffer buffer, VertexFormat format, RenderType material, AABB localBounds,
+                long generation, CompletableFuture<Void> upload,
+                int[] lightRunStarts, int[] lightRunLengths, int[] lightRunValues,
+                int lightBufferId, ByteBuffer lightScratch, LightMode lightMode) {
+        this.id = nextId++;
         this.ownerId = ownerId;
         this.buffer = buffer;
         this.format = format;
-        this.vertexCount = vertexCount;
-        this.meta = meta;
-        this.submitDistanceSq = submitDistanceSq;
+        this.material = material;
+        this.localBounds = localBounds;
+        this.generation = generation;
         this.upload = upload;
         this.lightRunStarts = lightRunStarts;
         this.lightRunLengths = lightRunLengths;
         this.lightRunValues = lightRunValues;
-        this.packedLight = meta.packedLight();
+        this.lightBufferId = lightBufferId;
+        this.lightScratch = lightScratch;
+        this.lightMode = lightMode;
+        this.lightUpdates = lightMode == LightMode.MUTABLE ? new LightRangeUpdates(lightScratch) : null;
     }
 
-    public ShardMeta meta() {
-        return this.meta;
+    /** 单调递增的句柄号，供库内排序（分组绘制）与统计使用。 */
+    int id() {
+        return this.id;
     }
 
-    public double submitDistanceSq() {
-        return this.submitDistanceSq;
+    RenderType material() { return this.material; }
+    AABB localBounds() { return this.localBounds; }
+
+    /**
+     * 修改 MUTABLE 网格的实际光照；范围单位为顶点，零光照表示黑暗。
+     * 渲染线程调用，可在几何上传尚未完成时暂存，首次可见绘制前合并上传脏范围。
+     * 本操作影响共享此句柄的所有实例；调用方负责排除自发光等固定范围。
+     * @return CPU 暂存光照是否实际发生变化
+     */
+    public boolean updateLight(int firstVertex, int vertexCount, int packedLight) {
+        RenderSystem.assertOnRenderThread();
+        if (!isAlive() || uploadFailed()) {
+            throw new IllegalStateException("Cannot update a released or failed shard");
+        }
+        if (this.lightUpdates == null) {
+            throw new IllegalStateException("Light range updates require MeshLighting.MUTABLE");
+        }
+        return this.lightUpdates.set(firstVertex, vertexCount, packedLight);
     }
 
-    /** 当前烘焙进顶点的光照（原地更新后会变，所以不能用 {@code meta().packedLight()}）。 */
-    public int packedLight() {
-        return this.packedLight;
+    LightRangeUpdates lightUpdates() {
+        return this.lightUpdates;
     }
 
-    /** 上传 future 完成即"已进入显存"，可用于 ready gate。 */
+    long generation() {
+        return this.generation;
+    }
+
+    /** 是否有独立光照流；全固定和全实例光照都不需要此缓冲。 */
+    boolean hasLightBuffer() {
+        return this.lightBufferId >= 0;
+    }
+
+    LightMode lightMode() {
+        return this.lightMode;
+    }
+
+    int lightBufferId() {
+        return this.lightBufferId;
+    }
+
+    ByteBuffer lightScratch() {
+        return this.lightScratch;
+    }
+
+    int lightValue() {
+        return this.lightValue;
+    }
+
+    void setLightValue(int value) {
+        this.lightValue = value;
+    }
+
+    /** 上传已成功完成；实际使用前还需检查 isAlive()。 */
     public boolean isUploaded() {
-        return this.upload.isDone();
+        return this.upload.isDone() && !this.upload.isCompletedExceptionally();
     }
 
-    /** 是否仍可用：既没有硬失效，也没有因引用归零被回收。 */
+    public boolean uploadFailed() {
+        return this.upload.isCompletedExceptionally();
+    }
+
+    /** 是否仍可用：既没有硬失效，也没有被所有者释放。 */
     public boolean isAlive() {
         return !this.dead && !this.retired;
     }
 
-    public int references() {
-        return this.references;
-    }
-
-    /** 同一个 mesh 被多个实例复用时调用。 */
-    public void retain() {
-        if (this.dead || this.retired) {
-            throw new IllegalStateException("Cannot retain a released shard");
-        }
-        this.references++;
-    }
-
-    /** 声明不再使用；引用归零后库会在上传完成后回收缓冲。 */
+    /** 所有者不再使用时释放；重复释放无操作，上传结束后再回收。 */
     public void release() {
-        StaticWorldRenderer.release(this);
+        WorldMeshRenderer.release(this);
     }
 
     String ownerId() {
@@ -102,10 +179,6 @@ public final class ShardHandle {
         return this.upload;
     }
 
-    int vertexCount() {
-        return this.vertexCount;
-    }
-
     int lightRunCount() {
         return this.lightRunStarts.length;
     }
@@ -122,29 +195,14 @@ public final class ShardHandle {
         return this.lightRunValues[index];
     }
 
-    /** 原地改写成功后同步账本：把该光照值的运行段改成新值。 */
-    void applyLightRewrite(int oldLight, int newLight) {
-        for (int i = 0; i < this.lightRunValues.length; i++) {
-            if (this.lightRunValues[i] == oldLight) {
-                this.lightRunValues[i] = newLight;
-            }
-        }
-        this.packedLight = newLight;
-    }
-
-    int releaseCount() {
-        if (this.dead || this.retired) {
-            return -1;
-        }
-        return --this.references;
-    }
-
-    void retire() {
+    boolean retire() {
+        if (this.dead || this.retired) return false;
         this.retired = true;
+        return true;
     }
 
-    boolean isRetired() {
-        return this.retired;
+    boolean isInvalidated() {
+        return this.dead;
     }
 
     boolean markRecycled() {
@@ -155,9 +213,16 @@ public final class ShardHandle {
         return true;
     }
 
+    boolean isLightStreamAttached() {
+        return this.lightStreamAttached;
+    }
+
+    void markLightStreamAttached() {
+        this.lightStreamAttached = true;
+    }
+
     void kill() {
         this.dead = true;
         this.retired = true;
-        this.references = 0;
     }
 }
