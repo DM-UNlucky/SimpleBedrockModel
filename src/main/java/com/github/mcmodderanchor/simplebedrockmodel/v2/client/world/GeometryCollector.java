@@ -30,9 +30,17 @@ public final class GeometryCollector {
 
     GeometryCollector() {}
 
-    /** 普通顶点 UV2 写 0，固定自发光写非零值。返回的 consumer 只在本次收集回调中有效。 */
+    /** 单个 pass 的 UV2 须全部为 0 或全部固定非零；混合时使用双材质重载。 */
     public VertexConsumer buffer(RenderType material, VertexFormat.Mode mode) {
         return this.meshes.computeIfAbsent(new Pass(material, mode), pass -> new MeshSink().begin(mode));
+    }
+
+    /** 将完整图元按 UV2 分流：0 跟随实例，非 0 使用独立发光材质。 */
+    public VertexConsumer buffer(RenderType ordinary, RenderType emissive, VertexFormat.Mode mode) {
+        if (Objects.requireNonNull(ordinary, "ordinary").equals(Objects.requireNonNull(emissive, "emissive"))) {
+            throw new IllegalArgumentException("Ordinary and emissive RenderTypes must differ");
+        }
+        return new LightPassVertexRouter(buffer(ordinary, mode), buffer(emissive, mode), mode);
     }
 
     private record BlockModelKey(ResourceLocation model, ResourceLocation texture, Direction facing) {}
@@ -51,9 +59,11 @@ public final class GeometryCollector {
         pose.mulPose(Axis.YP.rotationDegrees(-facing.toYRot()));
         var instance = model.createInstance();
         instance.resetPose();
-        model.renderBoneTree(instance, pose, buffer(RenderType.entityCutout(texture), VertexFormat.Mode.QUADS),
+        model.renderBoneTree(instance, pose, buffer(RenderType.entityCutout(texture),
+                        EmissiveMeshRenderTypes.cutout(texture, VertexFormat.Mode.QUADS), VertexFormat.Mode.QUADS),
                 0, OverlayTexture.NO_OVERLAY, 1, 1, 1, 1, true);
-        model.renderBoneTree(instance, pose, buffer(BedrockModelRenderTypes.polyMeshCutout(texture), VertexFormat.Mode.TRIANGLES),
+        model.renderBoneTree(instance, pose, buffer(BedrockModelRenderTypes.polyMeshCutout(texture),
+                        EmissiveMeshRenderTypes.cutout(texture, VertexFormat.Mode.TRIANGLES), VertexFormat.Mode.TRIANGLES),
                 0, OverlayTexture.NO_OVERLAY, 1, 1, 1, 1, false);
         return true;
     }

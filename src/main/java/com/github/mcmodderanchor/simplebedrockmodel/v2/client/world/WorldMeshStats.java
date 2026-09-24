@@ -7,13 +7,13 @@ public record WorldMeshStats(boolean enabled, int groups, int meshes, Frame fram
      * lightRangeUploads/Bytes 只统计 MUTABLE 脏范围的实际 GL 上传，不含创建时的整流分配。
      */
     public record Frame(int visible, int draws, int materials, int culled, int pending, int failed,
-                        int lightPatches, int lightRangeUploads, long lightRangeBytes,
+                        int lightRangeUploads, long lightRangeBytes,
                         double intervalMillis, double cpuMicros) {
     }
 
     /** 累计计数不随失效清零；lightBuffers 是当前分配数，其余光照模式数为累计提交数。 */
-    public record Totals(int submits, int releases, int lightBuffers, int lightPatches,
-                         int fixedMeshes, int uniformMeshes, int streamMeshes, int mutableMeshes,
+    public record Totals(int submits, int releases, int lightBuffers,
+                         int fixedMeshes, int uniformMeshes, int mutableMeshes,
                          long lightRangeUploads, long lightRangeBytes, int formatChanges) {
     }
 

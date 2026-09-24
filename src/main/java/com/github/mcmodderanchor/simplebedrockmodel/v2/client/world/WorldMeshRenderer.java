@@ -1,5 +1,6 @@
 package com.github.mcmodderanchor.simplebedrockmodel.v2.client.world;
 
+import com.github.mcmodderanchor.simplebedrockmodel.SimpleBedrockModel;
 import com.github.mcmodderanchor.simplebedrockmodel.v2.client.config.WorldMeshConfig;
 import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.systems.RenderSystem;
@@ -20,14 +21,16 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.api.distmarker.OnlyIn;
 import net.minecraftforge.client.event.RenderLevelStageEvent;
-import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.level.LevelEvent;
 import net.minecraftforge.event.TickEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
 import org.lwjgl.opengl.GL30;
 import org.joml.Matrix4f;
+import org.joml.Matrix3f;
 import org.joml.Vector3f;
 
 import java.nio.ByteBuffer;
@@ -53,6 +56,7 @@ import java.util.concurrent.CompletableFuture;
  * 不受 Embeddium 替换地形管线影响，也不在 Iris/Oculus 的 shadow pass 中触发。</p>
  */
 @OnlyIn(Dist.CLIENT)
+@Mod.EventBusSubscriber(modid = SimpleBedrockModel.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public final class WorldMeshRenderer {
     private static final int MAX_SAMPLERS = 12;
 
@@ -80,11 +84,16 @@ public final class WorldMeshRenderer {
     private static final LinkedHashMap<RenderType, List<CollectedShard>> GROUPS = new LinkedHashMap<>();
     private static final List<RenderType> GROUP_ORDER = new ArrayList<>();
     private static final Matrix4f SCRATCH_VIEW = new Matrix4f();
+    private static final Matrix3f SCRATCH_INVERSE_LINEAR = new Matrix3f();
+    private static final Matrix3f LAST_LIGHTING_LINEAR = new Matrix3f();
+    private static final Vector3f SCRATCH_LIGHT_0 = new Vector3f();
+    private static final Vector3f SCRATCH_LIGHT_1 = new Vector3f();
+    private static boolean lightingLinearCached;
     private static int collectedCount;
 
     private static boolean enabled = true;
-    private static boolean listening;
     private static long stateUpdateTick;
+    private static long worldDrawSerial;
     private static ClientLevel level;
 
     /** 顶点格式漂移的探测间隔；光影开关会让 Iris/AR 换掉 NEW_ENTITY 对应的格式。 */
@@ -97,6 +106,7 @@ public final class WorldMeshRenderer {
     private static final class CollectedShard {
         ShardHandle handle;
         Vec3 origin;
+        Matrix4f localTransform;
         AABB bounds;
         /** 归一后的实例光照：INSTANCE 使用实例值，FIXED 归零。 */
         int light;
@@ -109,6 +119,14 @@ public final class WorldMeshRenderer {
         return enabled;
     }
 
+    static long nextWorldDrawSerial() {
+        return worldDrawSerial + 1;
+    }
+
+    static long currentWorldDrawSerial() {
+        return worldDrawSerial;
+    }
+
     /** 运行时开关；关闭时丢弃几何缓存，保留渲染组对象，重新打开后会重新捕获。 */
     public static void setEnabled(boolean value) {
         RenderSystem.assertOnRenderThread();
@@ -116,9 +134,7 @@ public final class WorldMeshRenderer {
             return;
         }
         enabled = value;
-        if (value) {
-            ensureListening();
-        } else {
+        if (!value) {
             invalidate(Invalidation.SHUTDOWN);
         }
     }
@@ -135,7 +151,6 @@ public final class WorldMeshRenderer {
         WorldMeshGroup<K> group = new WorldMeshGroup<>(id, defaultStrategy, supported);
         MESH_GROUPS.put(id, group);
         group.applyPolicy();
-        ensureListening();
         return group;
     }
 
@@ -191,6 +206,8 @@ public final class WorldMeshRenderer {
             return null;
         }
 
+        ShardHandle.LightMode lightMode = MeshLighting.classify(mesh, lighting);
+
         VertexBuffer buffer = POOL.acquire(mesh.format());
         BufferBuilder builder = new BufferBuilder(Math.max(1536, mesh.estimatedBytes() / 6 + 64));
         builder.begin(mesh.mode(), mesh.format());
@@ -201,70 +218,31 @@ public final class WorldMeshRenderer {
             return null;
         }
 
-        int runCount = mesh.lightRunCount();
-        int[] runStarts = new int[runCount];
-        int[] runLengths = new int[runCount];
-        int[] runValues = new int[runCount];
-        boolean anyFollowsInstance = false;
-        boolean anyModelConstant = false;
-        for (int i = 0; i < runCount; i++) {
-            runStarts[i] = mesh.lightRunStart(i);
-            runLengths[i] = mesh.lightRunLength(i);
-            runValues[i] = mesh.lightRunValue(i);
-            // 模板值 0 = 跟随实例光照；非 0 = 模型自带光照（自发光 bone）。
-            if (lighting == MeshLighting.INSTANCE && runValues[i] == 0) {
-                anyFollowsInstance = true;
-            } else {
-                anyModelConstant = true;
-            }
-        }
-
-        ShardHandle.LightMode lightMode;
         int lightBufferId = -1;
         ByteBuffer lightScratch = null;
-        if (lighting == MeshLighting.MUTABLE) {
-            lightMode = ShardHandle.LightMode.MUTABLE;
+        if (lightMode == ShardHandle.LightMode.MUTABLE) {
             lightScratch = ByteBuffer.allocateDirect(mesh.vertexCount() * 4).order(ByteOrder.nativeOrder());
-            fillLightTemplate(lightScratch, runStarts, runLengths, runValues, runCount, mesh.vertexCount());
+            fillLightTemplate(lightScratch, mesh);
             lightBufferId = createLightBuffer(lightScratch);
-        } else if (anyFollowsInstance && anyModelConstant) {
-            // 混合：固定段与动态段必须在同一份按顶点的数据里，只能上光照缓冲。
-            lightMode = ShardHandle.LightMode.STREAM;
-            lightScratch = ByteBuffer.allocateDirect(mesh.vertexCount() * 4).order(ByteOrder.nativeOrder());
-            fillLightTemplate(lightScratch, runStarts, runLengths, runValues, runCount, mesh.vertexCount());
-            lightBufferId = createLightBuffer(lightScratch);
-        } else if (anyFollowsInstance) {
-            // 全动态：整个 draw 是同一个光照值 → 用常量属性，零缓冲零上传。
-            lightMode = ShardHandle.LightMode.UNIFORM;
-        } else {
-            // 全固定：光照已经烘在几何 buffer 里，attribute 4 直接读它。
-            lightMode = ShardHandle.LightMode.FIXED;
         }
 
         ShardHandle handle = new ShardHandle(owner.id(), buffer, mesh.format(),
-                material, mesh.bounds(), generation, dispatcher.uploadChunkLayer(rendered, buffer), runStarts, runLengths, runValues,
+                material, mesh.bounds(), generation, dispatcher.uploadChunkLayer(rendered, buffer),
                 lightBufferId, lightScratch, lightMode);
         SHARDS.add(handle);
         METRICS.recordSubmit(lightMode);
         return handle;
     }
 
-    /**
-     * 把"光照模板"写进 CPU 侧缓冲：值为 0 的顶点先留 0（绘制前按实例光照 patch），其余写模型自带的常量。
-     *
-     * <p>这是"部分 bone 固定满亮"的落点：{@code TreeBedrockModel.renderBone} 用
-     * {@code bone.illuminated ? LightTexture.pack(15,15) : packedLight} 决定光照，所以只要<b>烘焙时传 0</b>，
-     * 模板里的值就精确地是"0 = 跟随实例、非 0 = 模型固定"，不需要改 SBM 的渲染路径。</p>
-     */
-    private static void fillLightTemplate(ByteBuffer data, int[] runStarts, int[] runLengths, int[] runValues,
-                                          int runCount, int vertexCount) {
-        for (int i = 0; i < runCount; i++) {
-            int value = runValues[i];
+    /** 初始化 MUTABLE 光照流：动态范围留 0，固定范围写入捕获值。 */
+    private static void fillLightTemplate(ByteBuffer data, MeshSink mesh) {
+        for (int i = 0, count = mesh.lightRunCount(); i < count; i++) {
+            int value = mesh.lightRunValue(i);
             if (value == 0) {
                 continue;
             }
-            int end = Math.min(runStarts[i] + runLengths[i], vertexCount);
-            for (int vertex = runStarts[i]; vertex < end; vertex++) {
+            int end = Math.min(mesh.lightRunStart(i) + mesh.lightRunLength(i), mesh.vertexCount());
+            for (int vertex = mesh.lightRunStart(i); vertex < end; vertex++) {
                 data.putShort(vertex * 4, (short) (value & 0xFFFF));
                 data.putShort(vertex * 4 + 2, (short) (value >>> 16));
             }
@@ -282,39 +260,6 @@ public final class WorldMeshRenderer {
         GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, previous);
         METRICS.recordLightBufferCreated();
         return id;
-    }
-
-    /**
-     * 把实例光照写进光照流：只覆盖"模板值为 0"的运行段，自发光段保持创建时写入的常量。
-     *
-     * <p>整个缓冲是 4 B/顶点的连续数组，所以这里不存在交错布局那种"按 run 算偏移会写错字节"的问题。</p>
-     */
-    private static void patchLight(ShardHandle handle, int packedLight) {
-        ByteBuffer data = handle.lightScratch();
-        if (data == null) {
-            return;
-        }
-        short low = (short) (packedLight & 0xFFFF);
-        short high = (short) (packedLight >>> 16);
-        int runs = handle.lightRunCount();
-        for (int i = 0; i < runs; i++) {
-            if (handle.lightRunValue(i) != 0) {
-                continue;
-            }
-            int end = handle.lightRunStart(i) + handle.lightRunLength(i);
-            for (int vertex = handle.lightRunStart(i); vertex < end; vertex++) {
-                data.putShort(vertex * 4, low);
-                data.putShort(vertex * 4 + 2, high);
-            }
-        }
-        data.clear();
-
-        int previous = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
-        GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, handle.lightBufferId());
-        GL15.glBufferSubData(GL15.GL_ARRAY_BUFFER, 0L, data);
-        GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, previous);
-        handle.setLightValue(packedLight);
-        METRICS.recordLightPatch();
     }
 
     /** 仅上传 MUTABLE 流的脏区间；几何缓冲及其它实例的光照均保持不变。 */
@@ -411,7 +356,7 @@ public final class WorldMeshRenderer {
     }
 
     /** 用最小代价问一次"当前生效的顶点格式"：构造 1 个 quad 再丢弃，不碰 GL。 */
-    private static VertexFormat probeFormat() {
+    static VertexFormat probeFormat() {
         BufferBuilder probe = new BufferBuilder(1024);
         probe.begin(VertexFormat.Mode.QUADS, MeshSink.FORMAT);
         for (int i = 0; i < 4; i++) {
@@ -462,23 +407,15 @@ public final class WorldMeshRenderer {
         return METRICS.snapshot(enabled, MESH_GROUPS.size(), SHARDS.size(), POOL);
     }
 
-    private static void ensureListening() {
-        if (listening) {
-            return;
-        }
-        listening = true;
-        MinecraftForge.EVENT_BUS.addListener(WorldMeshRenderer::onRenderStage);
-        MinecraftForge.EVENT_BUS.addListener(WorldMeshRenderer::onLevelUnload);
-        MinecraftForge.EVENT_BUS.addListener(WorldMeshRenderer::onClientTick);
-    }
-
     static long stateUpdateTick() { return stateUpdateTick; }
 
-    private static void onClientTick(TickEvent.ClientTickEvent event) {
-        if (event.phase == TickEvent.Phase.END) stateUpdateTick++;
+    @SubscribeEvent
+    public static void onClientTick(TickEvent.ClientTickEvent event) {
+        if (!MESH_GROUPS.isEmpty() && event.phase == TickEvent.Phase.END) stateUpdateTick++;
     }
 
-    private static void onLevelUnload(LevelEvent.Unload event) {
+    @SubscribeEvent
+    public static void onLevelUnload(LevelEvent.Unload event) {
         if (!event.getLevel().isClientSide()) return;
         Runnable unload = () -> {
             if (event.getLevel() == level) {
@@ -563,10 +500,12 @@ public final class WorldMeshRenderer {
         }
     }
 
-    private static void onRenderStage(RenderLevelStageEvent event) {
-        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_BLOCK_ENTITIES) {
+    @SubscribeEvent
+    public static void onRenderStage(RenderLevelStageEvent event) {
+        if (MESH_GROUPS.isEmpty() || event.getStage() != RenderLevelStageEvent.Stage.AFTER_BLOCK_ENTITIES) {
             return;
         }
+        worldDrawSerial++;
         if (!ensureLevel() || MESH_GROUPS.isEmpty()) return;
         if (!enabled) {
             for (WorldMeshGroup<?> group : MESH_GROUPS.values()) group.refreshObjects();
@@ -640,14 +579,15 @@ public final class WorldMeshRenderer {
         int setups = 0;
         for (RenderType type : GROUP_ORDER) {
             List<CollectedShard> shardsOfType = GROUPS.get(type);
-            // 同一个几何体的实例必须连续，且同一份光照连续，才能在切组时只 patch 一次光照流。
-            // 没有光照流的 shard（光照全为常量）统一按 light=0 归一，不参与分组。
+            // 同一几何体和实例光照连续，避免反复绑定和设置常量 UV2。
+            // 全固定和 MUTABLE shard 的 light 归零，不参与光照分组。
             shardsOfType.sort(Comparator
                     .comparingInt((CollectedShard shard) -> shard.handle.id())
                     .thenComparingInt(shard -> shard.light)
                     .thenComparingDouble(shard ->
                             shard.bounds == null ? 0.0 : shard.bounds.distanceToSqr(cameraPosition)));
             type.setupRenderState();
+            lightingLinearCached = false;
             setups++;
             try {
                 ShaderInstance shader = RenderSystem.getShader();
@@ -683,22 +623,20 @@ public final class WorldMeshRenderer {
                             index = end;
                             continue;
                         }
-                        if (handle.lightMode() == ShardHandle.LightMode.MUTABLE) {
-                            flushLightUpdates(handle);
-                        } else if (handle.lightMode() == ShardHandle.LightMode.STREAM && handle.lightValue() != light) {
-                            patchLight(handle, light);
-                        }
+                        if (handle.lightMode() == ShardHandle.LightMode.MUTABLE) flushLightUpdates(handle);
                     }
                     for (int i = index; i < end; i++) {
                         Vec3 origin = shardsOfType.get(i).origin;
                         SCRATCH_VIEW.set(baseView).translate(
                                 (float) (origin.x - cameraPosition.x),
                                 (float) (origin.y - cameraPosition.y),
-                                (float) (origin.z - cameraPosition.z));
+                                (float) (origin.z - cameraPosition.z))
+                                .mul(shardsOfType.get(i).localTransform);
                         if (shader.MODEL_VIEW_MATRIX != null) {
                             shader.MODEL_VIEW_MATRIX.set(SCRATCH_VIEW);
                             shader.MODEL_VIEW_MATRIX.upload();
                         }
+                        uploadInstanceLighting(shader, shardsOfType.get(i).localTransform);
                         handle.buffer().draw();
                         draws++;
                     }
@@ -717,7 +655,8 @@ public final class WorldMeshRenderer {
         METRICS.endFrame(draws, setups, passStart);
     }
 
-    private static void collect(ShardHandle handle, Vec3 origin, AABB worldBounds, int packedLight) {
+    private static void collect(ShardHandle handle, Vec3 origin, Matrix4f localTransform,
+                                AABB worldBounds, int packedLight) {
         CollectedShard shard;
         if (collectedCount < COLLECTED.size()) {
             shard = COLLECTED.get(collectedCount);
@@ -727,6 +666,7 @@ public final class WorldMeshRenderer {
         }
         shard.handle = handle;
         shard.origin = origin;
+        shard.localTransform = localTransform;
         shard.bounds = worldBounds;
         // FIXED / MUTABLE 使用网格自身的光照，忽略实例值；
         // 全动态（UNIFORM）虽然不占缓冲，但它的常量属性值就是实例光照，所以必须按光照分组。
@@ -735,11 +675,37 @@ public final class WorldMeshRenderer {
         collectedCount++;
     }
 
+    /** 方向光由世界方向变换到当前网格的局部法线空间。 */
+    private static void uploadInstanceLighting(ShaderInstance shader, Matrix4f transform) {
+        if (shader.LIGHT0_DIRECTION == null && shader.LIGHT1_DIRECTION == null) return;
+        SCRATCH_INVERSE_LINEAR.set(transform);
+        if (lightingLinearCached && SCRATCH_INVERSE_LINEAR.equals(LAST_LIGHTING_LINEAR)) return;
+        LAST_LIGHTING_LINEAR.set(SCRATCH_INVERSE_LINEAR);
+        lightingLinearCached = true;
+        float determinant = SCRATCH_INVERSE_LINEAR.determinant();
+        if (Float.isFinite(determinant) && Math.abs(determinant) > 1.0E-10F) SCRATCH_INVERSE_LINEAR.invert();
+        else SCRATCH_INVERSE_LINEAR.identity();
+        boolean constantAmbient = Minecraft.getInstance().level != null
+                && Minecraft.getInstance().level.effects().constantAmbientLight();
+        if (shader.LIGHT0_DIRECTION != null) {
+            SCRATCH_LIGHT_0.set(constantAmbient ? LIGHT_0_NETHER : LIGHT_0_OVERWORLD)
+                    .mul(SCRATCH_INVERSE_LINEAR).normalize();
+            shader.LIGHT0_DIRECTION.set(SCRATCH_LIGHT_0);
+            shader.LIGHT0_DIRECTION.upload();
+        }
+        if (shader.LIGHT1_DIRECTION != null) {
+            SCRATCH_LIGHT_1.set(constantAmbient ? LIGHT_1_NETHER : LIGHT_1_OVERWORLD)
+                    .mul(SCRATCH_INVERSE_LINEAR).normalize();
+            shader.LIGHT1_DIRECTION.set(SCRATCH_LIGHT_1);
+            shader.LIGHT1_DIRECTION.upload();
+        }
+    }
+
     /**
      * 每个 RenderType 只做一次：共享 uniform + 一次 {@code apply()}。
-     * 逐 shard 只上传 ModelViewMat、bind、draw，这就是相对 {@code drawWithShader} 的收益来源。
+     * 逐 shard 上传 ModelViewMat；局部朝向改变时同步方向光，再 bind、draw。
      */
-    private static void uploadSharedUniforms(ShaderInstance shader, Matrix4f baseView, Matrix4f projection) {
+    static void uploadSharedUniforms(ShaderInstance shader, Matrix4f baseView, Matrix4f projection) {
         for (int i = 0; i < MAX_SAMPLERS; i++) {
             shader.setSampler("Sampler" + i, RenderSystem.getShaderTexture(i));
         }

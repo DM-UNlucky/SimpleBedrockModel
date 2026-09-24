@@ -1,6 +1,6 @@
-# Section 合批实验
+# Section 合批与光照压测
 
-在原有共享几何、逐实例 draw 路径之外，增加按 `16×16×16` section 合并的路径。
+世界网格支持共享几何的逐实例绘制，以及按 `16×16×16` section 合并绘制。
 两条路径使用同一 `WorldMeshRenderer`、材质和 `AFTER_BLOCK_ENTITIES` 绘制阶段。
 默认仍走逐实例路径，切换命令同时作用于示例方块实体和静态压力测试挂具。
 
@@ -46,7 +46,7 @@
 - 同一批次最多一份 pending；上传成功后替换 active，期间继续绘制旧网格。
   pending 期间继续发生的几何修改保留脏标记，在后续再次重建。
 - 共享 CPU 几何由缓存引用计数；批次版本独占 GPU 句柄并交给池回收。空批次立即释放，实例淘汰会更新所属批次。
-- 渲染组准备由库统一调度，调用方不实现 Source 或逐帧枚举 GPU 句柄。
+- 渲染组准备由库统一调度，GPU 句柄由库管理。
 - 提交时使用 `MeshLighting.MUTABLE`，实际光照存入独立的 4 B/顶点 UV2 缓冲；几何上传后不因光照变化而改写。
 
 ## 局部光照更新
@@ -104,35 +104,35 @@ active 和 pending 各自持有范围映射，只有模型、贴图、朝向、�
 - `stress.lightUpdateUs` 现在只记录最近一轮 tick 修改对象字段和 markDirty 的耗时，不再包含 CPU 光照范围暂存。
   读取对象状态、比较、暂存光照和实际上传提交都在渲染组遍历阶段，计入 `cpuUs`。整体影响还需结合 `frameMs` 与帧时间波动判断。
 
-切到逐实例路径时，全普通网格继续使用常量 UV2，不产生范围上传；混合自发光网格仍走原有实例光照流更新，
-由 `lightPatches` 统计。动态对照直接将每个实例的新光照传给模型绘制。
+切到逐实例路径时，普通网格使用常量 UV2，不产生范围上传；发光图元位于独立材质 pass，
+由无方向光的 shader 绘制。动态对照直接将每个实例的新光照传给模型绘制。
 
-额外检查更新中增删真实方块、改变朝向、跨 section 移动，以及移出视野后返回；模型应保留自发光，且不出现旧版范围串写。
+额外检查更新中增删真实方块、改变朝向、跨 section 移动，以及移出视野后返回；模型应保留自发光，且不出现光照范围串写。
 
 ## 当前边界
 
-- 光照更新按普通顶点范围上传；非常碎的自发光／普通顶点交错可能产生较多小范围上传，尚未引入合并间隙或上传字节预算。
+- 光照更新按普通顶点范围上传；自定义单材质 pass 若交错写入固定与动态光照，可能产生较多小范围上传。尚未引入合并间隙或上传字节预算。
 - 独立光照流额外消耗约 4 B/顶点 GPU 空间和同等 CPU 暂存空间，另有每版实例范围索引。
 - 烘焙/提交仍在渲染线程，软预算不是严格的时间或字节上限。
 - 初次接管及路径切换需要等待重建和下一帧上传，可能短暂不显示；旧批次只在已有 active 时可保留。
 - 批次成员变化在新版本可用前仍显示旧快照，移除的单个成员可能暂留；最后一个成员移除则立即释放。
-- 与原型的 INSTANCE 路径一样只捕获绑定姿势，当前接入的是 cutout；不处理透明排序、阴影 pass 或跨组几何合批。
+- 与 INSTANCE 路径一样只捕获绑定姿势，当前接入的是 cutout；不处理透明排序、阴影 pass 或跨组几何合批。
 - 分区复制各实例几何，显存通常高于共享 VBO。分区级剔除也可能多画几何。
 - 世界卸载清除对象；资源重载和 `cache clear` 仅失效缓存，保留压力渲染组。
 - 库内部逐实例路径使用 `MeshLighting.INSTANCE`，section 使用 `MeshLighting.MUTABLE`；调用方不选择这些存储模式。
 
 本次验证采用 Java 编译检查；游戏内兼容性、观感与性能数据需要实机 A/B。
 
-完整 API 与命令说明见 [世界网格原型接口](D:/Minecraft/Dev/SimpleBedrockModel/docs/world-mesh-rendering.md)。
+完整 API 与命令说明见 [世界网格渲染组接口](D:/Minecraft/Dev/SimpleBedrockModel/docs/world-mesh-rendering.md)。
 
-默认策略现在由创建 WorldMeshGroup 的调用方指定。`/sbmrender strategy auto|instance|section` 直接修改用户配置中的策略；
+默认策略由创建 WorldMeshGroup 的调用方指定。`/sbmrender strategy auto|instance|section` 直接修改用户配置中的策略；
 `/sbmmesh path` 是示例侧的同义入口。`/sbmrender groups` 可查看默认值、实际策略与选择来源。
 
-接入方式已统一为对象／适配器登记：方块示例使用 isRemoved 等有效性回调，压测对象直接实现 MeshRenderable；
-不需要调用方维护额外的 BlockPos→Observed 映射或光照顶点范围。
+接入方式为对象／适配器登记：方块示例使用 isRemoved 等有效性回调，压测对象直接实现 MeshRenderable；
+光照顶点范围由库管理。
 
-调用方不再创建 StaticObjectState／StaticGeometry；直接提供 geometryKey、位置、光照、显隐和 collectGeometry。
+调用方提供 geometryKey、位置、光照、显隐和 collectGeometry。
 材质及拓扑由 GeometryCollector 的实际输出确定，库再建立 section 批次。
 
-几何捕获已统一前移到 WorldMeshGroup.capturePending；section 策略只拼接已捕获结果，不回调业务对象。
+几何捕获由 WorldMeshGroup.capturePending 调度；section 策略拼接已捕获结果。
 `section.prepareMicros` 只反映批次准备阶段，共享几何捕获仍包含在全局 `cpuUs` 中。

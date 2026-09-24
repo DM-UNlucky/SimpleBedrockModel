@@ -1,6 +1,7 @@
 package com.github.mcmodderanchor.simplebedrockmodel.v2.client.world;
 
 import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4f;
 
 /** 可直接 track 的对象；库读取属性并按需调用几何收集，不要求调用方构造状态包装。 */
 public interface MeshRenderable {
@@ -18,6 +19,9 @@ public interface MeshRenderable {
     }
 
     Vec3 origin();
+
+    /** 相对 origin 的实例局部变换；默认恒等。 */
+    default Matrix4f localTransform() { return new Matrix4f(); }
 
     int packedLight();
 

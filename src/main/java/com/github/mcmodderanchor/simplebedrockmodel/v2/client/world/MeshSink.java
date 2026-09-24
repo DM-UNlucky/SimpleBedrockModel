@@ -6,6 +6,9 @@ import com.mojang.blaze3d.vertex.VertexFormat;
 import net.minecraft.world.phys.AABB;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.api.distmarker.OnlyIn;
+import org.joml.Matrix3f;
+import org.joml.Matrix4f;
+import org.joml.Vector3f;
 
 /**
  * 打包顶点捕获：把 {@link VertexConsumer} 调用写进扁平数组，不触碰 GL 与
@@ -16,8 +19,8 @@ import net.minecraftforge.api.distmarker.OnlyIn;
  * 只允许 {@link VertexFormat.Mode#QUADS} 与 {@link VertexFormat.Mode#TRIANGLES}。上层缓冲池按格式分桶，
  * 所以格式不能由调用方自带。</p>
  *
- * <p>世界网格绘制层的法线约定：按<b>世界朝向</b>烘焙（只含模型自身的旋转，不含相机视图旋转）。世界网格绘制层会用世界空间光源方向
- * 与之匹配；若把视图相关的内容烘进来，光照会随镜头变化。</p>
+ * <p>法线按共享网格的局部空间捕获，不含相机视图旋转。INSTANCE 绘制会把世界光源方向
+ * 变换到局部空间；SECTION 拼接时把法线变换到世界空间。</p>
  */
 @OnlyIn(Dist.CLIENT)
 public final class MeshSink implements VertexConsumer {
@@ -25,6 +28,7 @@ public final class MeshSink implements VertexConsumer {
     public static final int VERTEX_STRIDE_BYTES = FORMAT.getVertexSize();
 
     private static final int MIN_VERTICES = 64;
+    private static final Matrix4f IDENTITY = new Matrix4f();
 
     private VertexFormat.Mode mode = VertexFormat.Mode.QUADS;
     private int vertexCount;
@@ -155,6 +159,32 @@ public final class MeshSink implements VertexConsumer {
                     .uv2(this.lights[i])
                     .normal(this.normals[p], this.normals[p + 1], this.normals[p + 2])
                     .endVertex();
+        }
+    }
+
+    /** SECTION 拼接时应用实例局部变换，再加上相对 section 的平移。 */
+    public void emitTo(VertexConsumer out, Matrix4f transform, double x, double y, double z) {
+        if (transform.equals(IDENTITY)) {
+            emitTo(out, x, y, z);
+            return;
+        }
+        this.flush();
+        Matrix3f normalMatrix = new Matrix3f(transform);
+        float determinant = normalMatrix.determinant();
+        if (Float.isFinite(determinant) && Math.abs(determinant) > 1.0E-10F) normalMatrix.invert().transpose();
+        else normalMatrix.identity();
+        Vector3f position = new Vector3f();
+        Vector3f normal = new Vector3f();
+        for (int i = 0; i < this.vertexCount; i++) {
+            int p = i * 3;
+            int t = i * 2;
+            position.set(this.positions[p], this.positions[p + 1], this.positions[p + 2]).mulPosition(transform);
+            normal.set(this.normals[p], this.normals[p + 1], this.normals[p + 2]).mul(normalMatrix);
+            if (normal.lengthSquared() > 1.0E-12F) normal.normalize();
+            out.vertex(position.x + x, position.y + y, position.z + z)
+                    .color(this.colors[i]).uv(this.uvs[t], this.uvs[t + 1])
+                    .overlayCoords(this.overlays[i]).uv2(this.lights[i])
+                    .normal(normal.x, normal.y, normal.z).endVertex();
         }
     }
 

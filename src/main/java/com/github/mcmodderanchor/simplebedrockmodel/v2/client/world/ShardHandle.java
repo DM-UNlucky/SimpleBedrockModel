@@ -21,14 +21,12 @@ final class ShardHandle {
      *   <li>{@link LightMode#FIXED}：所有顶点都是烘焙时的实际光照→ attribute 4 直接读几何 buffer；</li>
      *   <li>{@link LightMode#UNIFORM}：所有顶点都跟随实例光照 → 整个 draw 是同一个值，用"关闭 attribute 数组 +
      *       整型常量属性"，不需要任何光照缓冲；</li>
-     *   <li>{@link LightMode#STREAM}：两者混合（部分 bone 满亮）→ 需要 4 B/顶点的光照缓冲。</li>
      *   <li>{@link LightMode#MUTABLE}：实际光照独立存储，由调用方按顶点范围更新。</li>
      * </ul>
      */
     enum LightMode {
         FIXED,
         UNIFORM,
-        STREAM,
         MUTABLE
     }
 
@@ -42,18 +40,13 @@ final class ShardHandle {
     private final AABB localBounds;
     private final long generation;
     private final CompletableFuture<Void> upload;
-    private final int[] lightRunStarts;
-    private final int[] lightRunLengths;
-    private final int[] lightRunValues;
     /** 光照独立流；-1 表示无需额外缓冲（FIXED 或 UNIFORM）。 */
     private final int lightBufferId;
-    /** 光照流的 CPU 暂存内容；STREAM 按模板更新，MUTABLE 按调用方指定范围更新。 */
+    /** MUTABLE 光照流的 CPU 暂存内容。 */
     private final ByteBuffer lightScratch;
     private final LightMode lightMode;
     private final LightRangeUpdates lightUpdates;
 
-    /** 光照缓冲当前内容对应的实例光照值；{@link Integer#MIN_VALUE} 表示还没写过。 */
-    private int lightValue = Integer.MIN_VALUE;
     private boolean retired;
     private boolean dead;
     private boolean recycled;
@@ -67,7 +60,6 @@ final class ShardHandle {
 
     ShardHandle(String ownerId, VertexBuffer buffer, VertexFormat format, RenderType material, AABB localBounds,
                 long generation, CompletableFuture<Void> upload,
-                int[] lightRunStarts, int[] lightRunLengths, int[] lightRunValues,
                 int lightBufferId, ByteBuffer lightScratch, LightMode lightMode) {
         this.id = nextId++;
         this.ownerId = ownerId;
@@ -77,9 +69,6 @@ final class ShardHandle {
         this.localBounds = localBounds;
         this.generation = generation;
         this.upload = upload;
-        this.lightRunStarts = lightRunStarts;
-        this.lightRunLengths = lightRunLengths;
-        this.lightRunValues = lightRunValues;
         this.lightBufferId = lightBufferId;
         this.lightScratch = lightScratch;
         this.lightMode = lightMode;
@@ -136,14 +125,6 @@ final class ShardHandle {
         return this.lightScratch;
     }
 
-    int lightValue() {
-        return this.lightValue;
-    }
-
-    void setLightValue(int value) {
-        this.lightValue = value;
-    }
-
     /** 上传已成功完成；实际使用前还需检查 isAlive()。 */
     public boolean isUploaded() {
         return this.upload.isDone() && !this.upload.isCompletedExceptionally();
@@ -177,22 +158,6 @@ final class ShardHandle {
 
     CompletableFuture<Void> upload() {
         return this.upload;
-    }
-
-    int lightRunCount() {
-        return this.lightRunStarts.length;
-    }
-
-    int lightRunStart(int index) {
-        return this.lightRunStarts[index];
-    }
-
-    int lightRunLength(int index) {
-        return this.lightRunLengths[index];
-    }
-
-    int lightRunValue(int index) {
-        return this.lightRunValues[index];
     }
 
     boolean retire() {

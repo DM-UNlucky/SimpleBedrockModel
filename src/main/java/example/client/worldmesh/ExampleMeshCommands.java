@@ -115,9 +115,9 @@ public final class ExampleMeshCommands {
         WorldMeshStats.Frame frame = stats.frame();
         reply(context, String.format(Locale.ROOT,
                 "World mesh enabled=%s, groups=%d, meshes=%d | draws=%d, materials=%d, culled=%d, pending=%d, failed=%d"
-                        + " | frameMs=%.2f, cpuUs=%.1f, lightPatches=%d, rangeUploads=%d, rangeBytes=%d",
+                        + " | frameMs=%.2f, cpuUs=%.1f, rangeUploads=%d, rangeBytes=%d",
                 stats.enabled(), stats.groups(), stats.meshes(), frame.draws(), frame.materials(), frame.culled(),
-                frame.pending(), frame.failed(), frame.intervalMillis(), frame.cpuMicros(), frame.lightPatches(),
+                frame.pending(), frame.failed(), frame.intervalMillis(), frame.cpuMicros(),
                 frame.lightRangeUploads(), frame.lightRangeBytes()));
         if (detail) {
             reply(context, "Lifetime " + stats.totals() + " " + stats.pool());

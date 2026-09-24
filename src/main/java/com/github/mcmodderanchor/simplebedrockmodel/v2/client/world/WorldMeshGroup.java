@@ -4,6 +4,7 @@ import com.github.mcmodderanchor.simplebedrockmodel.v2.client.config.WorldMeshCo
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4f;
 
 import java.util.EnumSet;
 import java.util.ArrayList;
@@ -15,12 +16,12 @@ import java.util.Set;
 
 /**
  * 库管理的世界网格渲染组。直接登记业务对象或其适配器，遍历时通过回调获取有效性与最新状态。
- * 全部方法在渲染线程调用。当前位置只支持平移，局部旋转／缩放属于几何描述的捕获状态。
+ * 全部方法在渲染线程调用。世界原点与局部实例矩阵独立于共享几何。
  */
 public final class WorldMeshGroup<T> implements AutoCloseable {
     @FunctionalInterface
     interface ShardSink {
-        void accept(ShardHandle handle, Vec3 origin, AABB worldBounds, int packedLight);
+        void accept(ShardHandle handle, Vec3 origin, Matrix4f localTransform, AABB worldBounds, int packedLight);
     }
 
     /** 自实现接口的对象共享一个桥接适配器；没有每对象的方法引用／lambda 分配。 */
@@ -46,6 +47,11 @@ public final class WorldMeshGroup<T> implements AutoCloseable {
         }
 
         @Override
+        public Matrix4f localTransform(Object object) {
+            return ((MeshRenderable) object).localTransform();
+        }
+
+        @Override
         public int packedLight(Object object) {
             return ((MeshRenderable) object).packedLight();
         }
@@ -67,12 +73,16 @@ public final class WorldMeshGroup<T> implements AutoCloseable {
         final MeshRenderableAdapter<? super T> adapter;
         Object geometryKey;
         Vec3 origin;
+        Matrix4f localTransform;
         int packedLight;
         boolean visible;
         boolean initialized;
         long dirtyRevision = 1;
         long readRevision;
         long lastCheckTick = Long.MIN_VALUE;
+        boolean explicitDraw;
+        long claimedDrawSerial = Long.MIN_VALUE;
+        Object claimedGeometryKey;
 
         Entry(T object, MeshRenderableAdapter<? super T> adapter) {
             this.object = object;
@@ -148,6 +158,27 @@ public final class WorldMeshGroup<T> implements AutoCloseable {
         if (entry != null && this.populated) removeBackend(entry);
     }
 
+    /**
+     * BER 在绘制单个对象前调用。首次调用后该对象改为显式绘制：仅当前主世界帧成功
+     * claim 的已上传 INSTANCE 网格会在 AFTER_BLOCK_ENTITIES 绘制；返回 false 时调用方
+     * 保留普通绘制。调用方应传入本帧实际外观对应的 key，不得只传上一帧快照。
+     */
+    public boolean claimForWorldDraw(T object, Object expectedGeometryKey) {
+        checkOpen();
+        Objects.requireNonNull(expectedGeometryKey, "expectedGeometryKey");
+        WorldMeshRenderer.ensureLevel();
+        Entry entry = this.objects.get(object);
+        if (entry == null) return false;
+        entry.explicitDraw = true;
+        entry.claimedDrawSerial = Long.MIN_VALUE;
+        entry.claimedGeometryKey = null;
+        if (!WorldMeshRenderer.isEnabled() || this.effectiveStrategy != WorldMeshStrategy.INSTANCE
+                || !this.instances.ready(entry, expectedGeometryKey)) return false;
+        entry.claimedGeometryKey = expectedGeometryKey;
+        entry.claimedDrawSerial = WorldMeshRenderer.nextWorldDrawSerial();
+        return true;
+    }
+
     /** 清除逻辑对象及其缓存；策略默认值和覆盖设置保持不变。 */
     public void clear() {
         checkOpen();
@@ -171,9 +202,9 @@ public final class WorldMeshGroup<T> implements AutoCloseable {
 
     private void updateBackend(Entry entry) {
         if (this.effectiveStrategy == WorldMeshStrategy.SECTION) {
-            this.sections.put(entry, entry.geometryKey, entry.origin, entry.packedLight);
+            this.sections.put(entry, entry.geometryKey, entry.origin, entry.localTransform, entry.packedLight);
         } else {
-            this.instances.put(entry, entry.geometryKey, entry.origin, entry.packedLight);
+            this.instances.put(entry, entry.geometryKey, entry.origin, entry.localTransform, entry.packedLight);
         }
     }
 
@@ -205,13 +236,17 @@ public final class WorldMeshGroup<T> implements AutoCloseable {
                 long revision = entry.dirtyRevision;
                 Object key = Objects.requireNonNull(entry.adapter.geometryKey(entry.object), "geometryKey");
                 Vec3 origin = Objects.requireNonNull(entry.adapter.origin(entry.object), "origin");
+                Matrix4f localTransform = new Matrix4f(Objects.requireNonNull(
+                        entry.adapter.localTransform(entry.object), "localTransform"));
                 int light = entry.adapter.packedLight(entry.object);
                 boolean visible = entry.adapter.isVisible(entry.object);
                 if (this.objects.get(entry.object) != entry) continue;
                 boolean changed = !entry.initialized || !key.equals(entry.geometryKey) || !origin.equals(entry.origin)
+                        || !localTransform.equals(entry.localTransform)
                         || light != entry.packedLight || visible != entry.visible;
                 entry.geometryKey = key;
                 entry.origin = origin;
+                entry.localTransform = localTransform;
                 entry.packedLight = light;
                 entry.visible = visible;
                 entry.initialized = true;
@@ -314,7 +349,10 @@ public final class WorldMeshGroup<T> implements AutoCloseable {
 
     void collect(ShardSink out) {
         if (this.effectiveStrategy == WorldMeshStrategy.SECTION) this.sections.collect(out);
-        else this.instances.collect(out);
+        else this.instances.collect(out, entry -> !entry.explicitDraw
+                || entry.claimedDrawSerial == WorldMeshRenderer.currentWorldDrawSerial()
+                && entry.visible && entry.claimedGeometryKey.equals(entry.geometryKey)
+                && this.instances.ready(entry, entry.claimedGeometryKey));
     }
 
     public WorldMeshGroupStats stats() {

@@ -1,29 +1,38 @@
 package com.github.mcmodderanchor.simplebedrockmodel.v2.client.world;
 
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.AABB;
+import org.joml.Matrix4f;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.IdentityHashMap;
+import java.util.function.Predicate;
 
 /** 逐实例绘制与共享几何换版；消费者无需持有句柄或引用计数。 */
 final class InstanceMeshBatches<K> {
     private final GeometryCache cache;
     private int preparationCursor;
     private final Map<K, Resident> residents = new LinkedHashMap<>();
-    private final class Resident {
+    private static final class Resident {
         GeometryCache.Entry active;
         GeometryCache.Entry pending;
         Vec3 origin;
+        Matrix4f localTransform;
         int light;
+        final Map<ShardHandle, AABB> worldBounds = new IdentityHashMap<>();
     }
     InstanceMeshBatches(GeometryCache cache) { this.cache = cache; }
 
-    void put(K id, Object geometryKey, Vec3 origin, int light) {
+    void put(K id, Object geometryKey, Vec3 origin, Matrix4f localTransform, int light) {
         Resident resident = this.residents.computeIfAbsent(id, ignored -> new Resident());
+        if (!origin.equals(resident.origin) || !localTransform.equals(resident.localTransform))
+            resident.worldBounds.clear();
         resident.origin = origin;
+        resident.localTransform = localTransform;
         resident.light = light;
         GeometryCache.Entry current = resident.pending == null ? resident.active : resident.pending;
         if (current != null && current.key.equals(geometryKey)) return;
@@ -62,15 +71,26 @@ final class InstanceMeshBatches<K> {
                 if (resident.active != null) resident.active.release();
                 resident.active = resident.pending;
                 resident.pending = null;
+                resident.worldBounds.clear();
             }
         }
     }
 
-    void collect(WorldMeshGroup.ShardSink out) {
-        for (Resident resident : this.residents.values()) {
+    boolean ready(K id, Object geometryKey) {
+        Resident resident = this.residents.get(id);
+        return resident != null && resident.active != null && resident.active.key.equals(geometryKey)
+                && resident.active.ready() && !resident.active.handles().isEmpty();
+    }
+
+    void collect(WorldMeshGroup.ShardSink out, Predicate<K> eligible) {
+        for (Map.Entry<K, Resident> entry : this.residents.entrySet()) {
+            if (!eligible.test(entry.getKey())) continue;
+            Resident resident = entry.getValue();
             if (resident.active == null) continue;
             for (ShardHandle handle : resident.active.handles()) {
-                out.accept(handle, resident.origin, handle.localBounds().move(resident.origin), resident.light);
+                out.accept(handle, resident.origin, resident.localTransform,
+                        resident.worldBounds.computeIfAbsent(handle, h -> WorldMeshTransforms.bounds(
+                                h.localBounds(), resident.localTransform, resident.origin)), resident.light);
             }
         }
     }

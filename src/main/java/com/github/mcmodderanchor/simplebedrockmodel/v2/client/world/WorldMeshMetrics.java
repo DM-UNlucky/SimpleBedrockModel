@@ -7,10 +7,8 @@ public final class WorldMeshMetrics {
     private int submits;
     private int releases;
     private int lightBuffers;
-    private int lightPatches;
     private int fixedMeshes;
     private int uniformMeshes;
-    private int streamMeshes;
     private int mutableMeshes;
     private long lightRangeUploads;
     private long lightRangeBytes;
@@ -22,8 +20,6 @@ public final class WorldMeshMetrics {
     private int culled;
     private int pending;
     private int failed;
-    private int lightPatchesThisFrame;
-    private int lightPatchesLastFrame;
     private int lightRangeUploadsThisFrame;
     private long lightRangeBytesThisFrame;
     private double cpuMicros;
@@ -38,7 +34,6 @@ public final class WorldMeshMetrics {
         switch (mode) {
             case FIXED -> this.fixedMeshes++;
             case UNIFORM -> this.uniformMeshes++;
-            case STREAM -> this.streamMeshes++;
             case MUTABLE -> this.mutableMeshes++;
         }
     }
@@ -47,11 +42,6 @@ public final class WorldMeshMetrics {
     void recordLightBufferCreated() { this.lightBuffers++; }
     void recordLightBufferReleased() { this.lightBuffers--; }
     void recordFormatChange() { this.formatChanges++; }
-
-    void recordLightPatch() {
-        this.lightPatches++;
-        this.lightPatchesThisFrame++;
-    }
 
     void recordLightRangeUpload(int bytes) {
         this.lightRangeUploads++;
@@ -68,7 +58,6 @@ public final class WorldMeshMetrics {
         }
         this.lastFrameNanos = now;
         this.cpuMicros = 0.0;
-        this.lightPatchesThisFrame = this.lightPatchesLastFrame = 0;
         this.lightRangeUploadsThisFrame = 0;
         this.lightRangeBytesThisFrame = 0;
     }
@@ -83,14 +72,12 @@ public final class WorldMeshMetrics {
     void endFrame(int draws, int materials, long passStartNanos) {
         this.draws = draws;
         this.materials = materials;
-        this.lightPatchesLastFrame = this.lightPatchesThisFrame;
         this.cpuMicros = (System.nanoTime() - passStartNanos) / 1000.0;
     }
 
     /** 失效时只清帧数据；累计计数与当前光照缓冲数保留。 */
     void clearFrame() {
         this.visible = this.draws = this.materials = this.culled = this.pending = this.failed = 0;
-        this.lightPatchesThisFrame = this.lightPatchesLastFrame = 0;
         this.lightRangeUploadsThisFrame = 0;
         this.lightRangeBytesThisFrame = 0;
         this.frameSampleIndex = this.frameSampleCount = 0;
@@ -101,10 +88,10 @@ public final class WorldMeshMetrics {
     WorldMeshStats snapshot(boolean enabled, int groups, int meshes, VertexBufferPool pool) {
         return new WorldMeshStats(enabled, groups, meshes,
                 new WorldMeshStats.Frame(this.visible, this.draws, this.materials, this.culled,
-                        this.pending, this.failed, this.lightPatchesLastFrame, this.lightRangeUploadsThisFrame,
+                        this.pending, this.failed, this.lightRangeUploadsThisFrame,
                         this.lightRangeBytesThisFrame, averageFrameMillis(), this.cpuMicros),
-                new WorldMeshStats.Totals(this.submits, this.releases, this.lightBuffers, this.lightPatches,
-                        this.fixedMeshes, this.uniformMeshes, this.streamMeshes, this.mutableMeshes,
+                new WorldMeshStats.Totals(this.submits, this.releases, this.lightBuffers,
+                        this.fixedMeshes, this.uniformMeshes, this.mutableMeshes,
                         this.lightRangeUploads, this.lightRangeBytes, this.formatChanges),
                 new WorldMeshStats.Pool(pool.created(), pool.reused(), pool.idleCount()));
     }

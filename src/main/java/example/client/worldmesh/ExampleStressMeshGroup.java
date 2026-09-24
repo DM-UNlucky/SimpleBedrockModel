@@ -1,5 +1,6 @@
 package example.client.worldmesh;
 
+import com.github.mcmodderanchor.simplebedrockmodel.SimpleBedrockModel;
 import com.github.mcmodderanchor.simplebedrockmodel.v1.client.renderer.BedrockModelRenderTypes;
 import com.github.mcmodderanchor.simplebedrockmodel.v2.client.world.WorldMeshRenderer;
 import com.github.mcmodderanchor.simplebedrockmodel.v2.client.world.WorldMeshGroup;
@@ -26,8 +27,9 @@ import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.api.distmarker.OnlyIn;
 import net.minecraftforge.client.event.RenderLevelStageEvent;
-import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.event.TickEvent;
+import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.fml.common.Mod;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -45,6 +47,7 @@ import java.util.Locale;
  * </ul>
  */
 @OnlyIn(Dist.CLIENT)
+@Mod.EventBusSubscriber(modid = SimpleBedrockModel.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public final class ExampleStressMeshGroup {
     public static final String ID = "example:stress";
 
@@ -57,7 +60,6 @@ public final class ExampleStressMeshGroup {
     private static ClientLevel world;
 
     private static boolean registered;
-    private static boolean dynamicListening;
     private static Mode mode = Mode.SAME;
     private static int spawnFailures;
     private static boolean lightCycling;
@@ -102,7 +104,6 @@ public final class ExampleStressMeshGroup {
         }
         registered = true;
         group = WorldMeshRenderer.createGroup(ID, WorldMeshStrategy.INSTANCE);
-        MinecraftForge.EVENT_BUS.addListener(ExampleStressMeshGroup::onClientTick);
     }
 
     static String stats() {
@@ -159,8 +160,9 @@ public final class ExampleStressMeshGroup {
         if (mode != Mode.DYNAMIC) group.markDirty(instance);
     }
 
-    private static void onClientTick(TickEvent.ClientTickEvent event) {
-        if (event.phase != TickEvent.Phase.END) return;
+    @SubscribeEvent
+    public static void onClientTick(TickEvent.ClientTickEvent event) {
+        if (!registered || event.phase != TickEvent.Phase.END) return;
         Minecraft minecraft = Minecraft.getInstance();
         if (world != minecraft.level) {
             clear();
@@ -200,10 +202,6 @@ public final class ExampleStressMeshGroup {
         world = level;
         mode = newMode;
         spawnFailures = 0;
-        if (newMode == Mode.DYNAMIC) {
-            ensureDynamicListener();
-        }
-
         Vec3 eye = player.getEyePosition();
         Vec3 look = player.getLookAngle();
         Vec3 forward = new Vec3(look.x, 0.0, look.z);
@@ -256,16 +254,9 @@ public final class ExampleStressMeshGroup {
         return spawned;
     }
 
-    private static void ensureDynamicListener() {
-        if (dynamicListening) {
-            return;
-        }
-        dynamicListening = true;
-        MinecraftForge.EVENT_BUS.addListener(ExampleStressMeshGroup::onRenderStage);
-    }
-
     /** 动态对照组：同一批实例走原版路径（装了 AR 时就是 AR 路径），姿势与静态路径逐字对齐。 */
-    private static void onRenderStage(RenderLevelStageEvent event) {
+    @SubscribeEvent
+    public static void onRenderStage(RenderLevelStageEvent event) {
         if (mode != Mode.DYNAMIC || INSTANCES.isEmpty()) {
             return;
         }

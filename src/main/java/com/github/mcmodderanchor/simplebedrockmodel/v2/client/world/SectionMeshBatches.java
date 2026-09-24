@@ -1,6 +1,7 @@
 package com.github.mcmodderanchor.simplebedrockmodel.v2.client.world;
 
 import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4f;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.api.distmarker.OnlyIn;
 
@@ -17,18 +18,19 @@ import java.util.Map;
  * 不接入地形 chunk layer，不进行 VBO 子分配，也不承担透明排序。
  */
 @OnlyIn(Dist.CLIENT)
-final class SectionMeshBatches<K> {
+public final class SectionMeshBatches<K> {
     private static final int MAX_BUILDS_PER_FRAME = 4;
     // 软预算：不在单个模型/批次内部中断，所以一个超大批次仍可能超时。
     private static final long BUILD_BUDGET_NANOS = 2_000_000L;
 
-    private record Member(GeometryCache.Entry geometry, Vec3 origin, int light) {
+    private record Member(GeometryCache.Entry geometry, Vec3 origin, Matrix4f transform, int light) {
         boolean sameGeometry(Member other) {
-            return this.geometry.key.equals(other.geometry.key) && this.origin.equals(other.origin);
+            return this.geometry.key.equals(other.geometry.key) && this.origin.equals(other.origin)
+                    && this.transform.equals(other.transform);
         }
     }
 
-    private record PendingMember(GeometryCache.Entry geometry, Vec3 origin, int light) {}
+    private record PendingMember(GeometryCache.Entry geometry, Vec3 origin, Matrix4f transform, int light) {}
 
     private record LightRange(int firstVertex, int vertexCount) {
     }
@@ -84,13 +86,13 @@ final class SectionMeshBatches<K> {
     private long lightChanges;
     private double prepareMicros;
 
-    void put(K id, Object geometryKey, Vec3 origin, int light) {
+    void put(K id, Object geometryKey, Vec3 origin, Matrix4f transform, int light) {
         Member old = this.members.get(id);
         if (old != null && old.geometry.key.equals(geometryKey)) {
             PendingMember pending = this.pendingMembers.remove(id);
             if (pending != null) pending.geometry.release();
-            if (old.origin.equals(origin) && old.light == light) return;
-            installMember(id, new Member(old.geometry, origin, light));
+            if (old.origin.equals(origin) && old.transform.equals(transform) && old.light == light) return;
+            installMember(id, new Member(old.geometry, origin, transform, light));
             return;
         }
         PendingMember pending = this.pendingMembers.get(id);
@@ -101,7 +103,7 @@ final class SectionMeshBatches<K> {
             entry = this.cache.acquire(geometryKey);
             if (pending != null) pending.geometry.release();
         }
-        this.pendingMembers.put(id, new PendingMember(entry, origin, light));
+        this.pendingMembers.put(id, new PendingMember(entry, origin, transform, light));
     }
 
     /** 材质 pass 由捕获结果决定；共享 CPU 网格就绪后才加入批次。 */
@@ -112,7 +114,7 @@ final class SectionMeshBatches<K> {
             PendingMember pending = entry.getValue();
             if (!pending.geometry.captured()) continue;
             iterator.remove();
-            installMember(entry.getKey(), new Member(pending.geometry, pending.origin, pending.light));
+            installMember(entry.getKey(), new Member(pending.geometry, pending.origin, pending.transform, pending.light));
         }
     }
 
@@ -145,7 +147,8 @@ final class SectionMeshBatches<K> {
     private void patchLight(Version version, K id, Member member) {
         if (version == null || !version.handle.isAlive() || version.handle.uploadFailed()) return;
         LightSlice slice = version.slices.get(id);
-        if (slice == null || !slice.captured.sameGeometry(member) || slice.appliedLight == member.light) return;
+        if (slice == null || slice.ranges.isEmpty() || !slice.captured.sameGeometry(member)
+                || slice.appliedLight == member.light) return;
         for (LightRange range : slice.ranges) {
             version.handle.updateLight(range.firstVertex, range.vertexCount, member.light);
         }
@@ -237,7 +240,7 @@ final class SectionMeshBatches<K> {
             int firstVertex = sink.vertexCount();
             int firstRun = Math.max(0, sink.lightRunCount() - 1);
             // 用 0 捕获普通顶点，非零保持自发光；只记录普通顶点的范围。
-            member.geometry.mesh(key.pass).emitTo(sink,
+            member.geometry.mesh(key.pass).emitTo(sink, member.transform,
                     member.origin.x - key.origin.x, member.origin.y - key.origin.y, member.origin.z - key.origin.z);
             int endVertex = sink.vertexCount();
             List<LightRange> ranges = new ArrayList<>();
@@ -256,8 +259,17 @@ final class SectionMeshBatches<K> {
             batch.dirty = false;
             return;
         }
+        // 纯发光批次的 UV2 全是固定值，直接读几何缓冲，不分配可变光照流。
+        boolean hasDynamicLight = false;
+        for (int run = 0, count = sink.lightRunCount(); run < count; run++) {
+            if (sink.lightRunValue(run) == 0) {
+                hasDynamicLight = true;
+                break;
+            }
+        }
         // 保存真实局部包围盒；枚举时平移到世界坐标，允许几何跨 section 边界。
-        ShardHandle submitted = WorldMeshRenderer.submit(owner, sink, key.pass.material(), MeshLighting.MUTABLE);
+        ShardHandle submitted = WorldMeshRenderer.submit(owner, sink, key.pass.material(),
+                hasDynamicLight ? MeshLighting.MUTABLE : MeshLighting.INSTANCE);
         if (submitted == null) {
             this.failures++;
             return;
@@ -275,7 +287,8 @@ final class SectionMeshBatches<K> {
             Version version = entry.getValue().active;
             ShardHandle active = version == null ? null : version.handle;
             if (active != null && active.isAlive()) {
-                out.accept(active, entry.getKey().origin, active.localBounds().move(entry.getKey().origin), 0);
+                out.accept(active, entry.getKey().origin, new Matrix4f(),
+                        active.localBounds().move(entry.getKey().origin), 0);
             }
         }
     }

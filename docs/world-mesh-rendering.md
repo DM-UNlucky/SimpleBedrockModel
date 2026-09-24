@@ -1,6 +1,6 @@
 # 世界网格渲染组：分工、API 与策略覆盖
 
-更新日期：2026-09-23。本文描述当前已落地的渲染组接口；原型接口直接迁移，不保留 Source 或手动句柄接口的兼容层。
+更新日期：2026-09-24。本文描述当前渲染组接口。
 
 ## 分工
 
@@ -14,8 +14,7 @@
 | 声明渲染组支持的策略和默认策略 | 配置策略解析与缓存迁移 |
 | 光照采样、对象有效性和业务距离限制 | 视锥剔除、资源重载和世界卸载处理 |
 
-公开 Source 接口已删除。调用方不实现 prepareFrame、forEachShard、onInvalidate，也不持有 GPU 句柄。
-库直接遍历自己管理的具体 WorldMeshGroup 对象，没有再用一个可由调用方实现的 Source 包装渲染组。
+库直接遍历自己管理的 WorldMeshGroup 对象并持有 GPU 句柄。
 
 ## 对象登记接口
 
@@ -33,6 +32,7 @@ group.close();
 
 两种 track 是替代关系，不需要同时调用。渲染组以对象引用身份登记，不使用其 equals/hashCode，也不要求额外提供 BlockPos key。
 相同对象重复 track 无操作，不更换回调、不强制刷新，因此可以在 BER 中重复调用。
+需要保留 BER 回退的对象，应创建仅支持 INSTANCE 的渲染组，并在每次普通世界 BER 绘制前调用 `claimForWorldDraw(object, expectedGeometryKey)`。首次调用后该对象改为显式帧级绘制：只有与本帧期望 key 相同且全部 pass 已上传的 active 网格才返回 true，并在随后 `AFTER_BLOCK_ENTITIES` 阶段绘制；返回 false 时 BER 应照常绘制。未再次 claim 的后续主世界帧不会复用上一次的绘制决定。该方法不支持 SECTION。光影阴影 pass 不应调用此方法。关闭世界网格绘制时返回 false，逻辑对象继续登记。
 如需更换该对象的适配器，先 untrack 再 track。不同对象即使 equals 相等，也分别登记。
 渲染组持有对象引用直到无效、untrack、clear、close 或世界卸载；对象保持有效时不会因 GC 自动丢失。
 
@@ -44,15 +44,15 @@ group.close();
 | `needsUpdate()` | 是否重新读取轻量属性 | true |
 | `isVisible()` | 整个对象是否可见；隐藏仍保留登记 | true |
 | `origin()` | 当前世界原点 | 必须提供 |
+| `localTransform()` | 相对 origin 的实例矩阵，供位置、旋转和统一缩放 | 恒等矩阵 |
 | `packedLight()` | 当前实例光照 | 必须提供 |
 | `geometryKey()` | 不可变的共享几何 key | 必须提供，不能为 null |
 | `collectGeometry(collector)` | 向库提供的收集器写入局部几何 | 必须提供；资源暂不可用返回 false |
 
-StaticObjectState 和 StaticGeometry 已删除；渲染组直接保存比较字段，缓存直接按 geometryKey 管理几何。
-渲染组内部读取属性、保存比较快照，决定是否重建或更新光照；调用方无需创建状态包装、几何描述或 Pass 列表。
+渲染组内部读取属性、保存比较快照，决定是否重建或更新光照；缓存按 geometryKey 管理几何。
 
 几何 key 必须包含影响捕获结果的全部状态：模型、材质／贴图、拓扑、局部姿势、骨骼显隐等。
-世界原点、实例光照和整体显隐独立提供，通常不进入几何 key。
+世界原点、localTransform、实例光照和整体显隐独立提供，不进入几何 key。INSTANCE 共享同一 VBO 并逐对象应用矩阵；SECTION 在重建时把局部矩阵烘入分区顶点，因此变换变化会重建受影响批次。
 相同 key 表示完整几何及材质结果可共享；不同适配器在同一渲染组中也必须遵守这一约定。
 
 没有可靠脏标记时保留 needsUpdate 默认值；有可靠通知时可以返回 false，并在变化后 markDirty。
@@ -94,14 +94,15 @@ ExampleStressMeshGroup 的测试对象直接实现接口，needsUpdate=false，�
 
 GeometryCollector 由库创建并传入 collectGeometry，只在这次回调内使用，不能自行构造或保存供以后写入。
 
-- `collector.blockModel(modelId, texture, facing)`：按资源 ID 获取当前 SBM 树模型，绑定姿势、局部平移 `(0.5,0,0.5)`、应用朝向；自动收集 QUADS 与 TRIANGLES，资源暂缺返回 false。
-- `collector.buffer(material, mode)`：获取 VertexConsumer，供自定义模型直接写顶点；同材质／拓扑的多次写入自动合并。
+- `collector.blockModel(modelId, texture, facing)`：按资源 ID 获取当前 SBM 树模型，绑定姿势、局部平移 `(0.5,0,0.5)`、应用朝向；自动收集 QUADS 与 TRIANGLES，并把固定发光图元送往无方向光的独立材质；资源暂缺返回 false。
+- `collector.buffer(material, mode)`：获取 VertexConsumer，供自定义模型直接写顶点；同材质／拓扑的多次写入自动合并。INSTANCE 中一个 pass 的 UV2 须全部为 0 或全部固定非零；混合时须使用双材质重载。
+- `collector.buffer(ordinary, emissive, mode)`：按图元的 UV2 将普通／固定发光顶点分流到两个 RenderType；同一图元内不能混用两种光照语义。
 
 自定义捕获示意：
 
 ```java
 public boolean collectGeometry(GeometryCollector collector) {
-    VertexConsumer output = collector.buffer(material, VertexFormat.Mode.QUADS);
+    VertexConsumer output = collector.buffer(material, emissiveMaterial, VertexFormat.Mode.QUADS);
     // 将局部顶点写入 output，或将它交给已有模型渲染方法。
     // 普通顶点 UV2 写 0，自发光顶点写固定非零值。
     renderModel(output);
@@ -109,7 +110,7 @@ public boolean collectGeometry(GeometryCollector collector) {
 }
 ```
 
-NEW_ENTITY 顶点语义支持 QUADS／TRIANGLES；局部法线应包含对象静态朝向，不能包含相机旋转。
+NEW_ENTITY 顶点语义支持 QUADS／TRIANGLES；法线留在共享网格的局部空间，不能包含相机旋转。INSTANCE 的方向光会按实例矩阵转换到局部空间，当前适用于旋转与统一缩放；非均匀缩放应在捕获时处理并由几何 key 标识。SECTION 拼接时会变换位置和法线。
 返回 true 且没有顶点是有效空几何；返回 false 会丢弃本次部分结果并限额重试。
 资源重载后会重新调用收集方法，因此通过资源 ID 获取当前模型，不永久使用旧资源引用。
 
@@ -122,7 +123,7 @@ NEW_ENTITY 顶点语义支持 QUADS／TRIANGLES；局部法线应包含对象静
 每次世界绘制阶段遍历登记项：
 
 1. 检查 isValid，无效项解除登记并交给库释放缓存引用。
-2. 初次登记、markDirty 或资源失效时，强制读取 geometryKey、origin、packedLight、isVisible。
+2. 初次登记、markDirty 或资源失效时，强制读取 geometryKey、origin、localTransform、packedLight、isVisible。
 3. 其余对象每客户端 tick 至多检查一次 needsUpdate，返回 true 才读取属性。
 4. 库比较内部快照，按需共享／捕获几何、更新位置、更新光照或切换显隐。
 
@@ -130,7 +131,7 @@ NEW_ENTITY 顶点语义支持 QUADS／TRIANGLES；局部法线应包含对象静
 资源重载及 clearCaches 不受 needsUpdate=false 阻挡。markDirty 只请求读取最新属性；key 未变且只有光照变化时不会重新收集几何。
 属性回调中再次 markDirty 的通知保留到下一次遍历。回调不应创建／关闭渲染组或修改全局渲染配置。
 
-对象的位置、光照和显隐直接从自身属性返回。当前世界原点只支持平移，局部姿势、缩放和骨骼显隐由 collectGeometry 处理，并体现在 geometryKey 中。
+对象的位置、实例局部变换、光照和显隐直接从自身属性返回。会改变模型自身形状、骨骼姿势和内部显隐的状态仍由 collectGeometry 处理，并体现在 geometryKey 中。单纯的实例位置和旋转留在 localTransform。
 
 ## 策略选择
 
@@ -165,8 +166,7 @@ strategy = "AUTO" # AUTO / INSTANCE / SECTION
 ```
 
 命令直接修改客户端配置文件中的 `worldMesh.strategy`，与手动修改配置使用同一个设置；AUTO 使用调用方默认策略。
-旧配置中的 `[staticWorld]` 不再读取；已有自定义策略需将该节名改为 `[worldMesh]`。
-每个渲染阶段检查已加载的配置，修改实际策略时保留所有对象、光照、显隐及几何描述，释放旧缓存并重建。
+每个渲染阶段检查已加载的配置，修改实际策略时保留所有对象及其属性，释放原有缓存并重建。
 当前迁移仍有预热窗口，未承诺策略切换时新旧后端无缝双缓冲。
 
 示例的 `/sbmmesh path auto|instance|section` 修改同一配置项，同时启用世界网格绘制层。
@@ -200,16 +200,16 @@ GPU 上传仍经由原版 ChunkRenderDispatcher。已排队的缓冲在完成前
 - WorldMeshRenderer：上传队列、缓冲池、统一世界绘制和统计。
 - WorldMeshMetrics：内部累计计数与帧采样；`WorldMeshRenderer.stats()` 从中构造不可变的 `WorldMeshStats` 快照。
 
-ShardHandle、MeshLighting 和原始 submit 是内部实现；ShardMeta 已移除。共享计数只在几何缓存维护，不再由 GPU 句柄重复计数。
+ShardHandle、MeshLighting 和原始 submit 是内部实现。共享计数由几何缓存维护。
 局部光照仍采用独立 4 B/顶点流，合并相邻／重叠脏区间，并在可见绘制前上传；调用方只需修改自身光照并 markDirty，或通过 needsUpdate 和属性方法被动报告变化。
-自发光范围由模板识别后排除，不要求调用方记录顶点编号。
+便捷捕获将发光图元拆成独立 RenderType，其 shader 不按法线方向调暗；SECTION 的纯发光批次直接读取固定 UV2，不分配独立光照流。普通顶点的局部光照范围仍由模板识别，不要求调用方记录顶点编号。
 
 每个渲染组独立缓存，目前没有跨组几何去重。渲染组统一限额捕获共享几何，策略只处理已捕获结果；捕获和网格准备各有最多 4 项、约 2ms 的软预算。
 单次捕获或单个大批次仍可能超过预算；光照上传暂未设置独立字节预算。
 首帧、资源重载和策略切换可能短暂缺几何；SECTION 增删／显隐变化可能保留旧快照直到新版就绪。
 固定阶段为 AFTER_BLOCK_ENTITIES；不处理透明排序、第三人称物品矩阵或阴影 pass。
 
-## 诊断和迁移
+## 诊断
 
 全局 stats 返回 WorldMeshStats；groupStats 与 group.stats 返回 WorldMeshGroupStats，包含默认／实际策略、来源、拒绝原因、对象数和缓存数据。
 命令只按需输出，不恢复逐帧日志或 VAO 微计时探针。
@@ -220,11 +220,8 @@ ShardHandle、MeshLighting 和原始 submit 是内部实现；ShardMeta 已移�
 - `/sbmmesh stress same|models|all|dynamic [count]`、`stress clear`：生成／清除压力渲染组。
 - `/sbmmesh stress light start [intervalTicks] [batchSize]`、`stop`、`reset`：定时光照实验。
 
-旧 Source 的 register／枚举／失效回调、手动 submit、retain/release 均不再是调用方接入点。
-上一版按 id 推送 put/setLight/setVisible/remove 的接口也已移除，统一为 track/markDirty/untrack。
-readState 及要求调用方创建 StaticObjectState／StaticGeometry 的用法已移除，改为直接提供属性与 collectGeometry。
-原 example 的 StaticMeshCache 和 SectionMeshBatches 已移除；通用机制归入库，示例只保留业务采集与压测。
-INSTANCE／MUTABLE 是内部提交语义，公共策略只表达 INSTANCE／SECTION；固定 UV2 布局由捕获结果自动选择。
+调用方使用 track/markDirty/untrack 管理对象，直接提供属性与 collectGeometry。示例提供业务采集与压测，网格缓存和批次由库管理。
+INSTANCE／MUTABLE 是内部提交语义，公共策略为 INSTANCE／SECTION；固定 UV2 布局由捕获结果自动选择。
 
 frameMs 是最多 120 次世界绘制阶段间隔均值，cpuUs 是本层 CPU 时间，不是 GPU 计时。
 局部上传和压力计时的具体判读见 [Section 与光照压测](D:/Minecraft/Dev/SimpleBedrockModel/docs/world-mesh-section-prototype.md)。

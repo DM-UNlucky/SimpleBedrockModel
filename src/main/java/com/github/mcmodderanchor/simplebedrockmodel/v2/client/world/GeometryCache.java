@@ -25,7 +25,7 @@ final class GeometryCache {
         Set<GeometryCollector.Pass> passes() { return this.meshes.keySet(); }
         MeshSink mesh(GeometryCollector.Pass pass) { return this.meshes.get(pass); }
 
-        /** 只上传已经捕获的结果，不在此处反向触发对象收集。 */
+        /** 上传已经捕获的结果 */
         boolean prepareGpu(WorldMeshGroup<?> group) {
             if (!captured()) return false;
             if (this.handles != null) {
@@ -35,15 +35,20 @@ final class GeometryCache {
                 } else return ready();
             }
             List<ShardHandle> uploaded = new ArrayList<>();
-            for (GeometryCollector.Pass pass : passes()) {
-                MeshSink mesh = mesh(pass);
-                ShardHandle handle = WorldMeshRenderer.submit(group, mesh, pass.material(), MeshLighting.INSTANCE);
-                if (handle == null) {
-                    uploaded.forEach(ShardHandle::release);
-                    failures++;
-                    return false;
+            try {
+                for (GeometryCollector.Pass pass : passes()) {
+                    MeshSink mesh = mesh(pass);
+                    ShardHandle handle = WorldMeshRenderer.submit(group, mesh, pass.material(), MeshLighting.INSTANCE);
+                    if (handle == null) {
+                        uploaded.forEach(ShardHandle::release);
+                        failures++;
+                        return false;
+                    }
+                    uploaded.add(handle);
                 }
-                uploaded.add(handle);
+            } catch (RuntimeException exception) {
+                uploaded.forEach(ShardHandle::release);
+                throw exception;
             }
             this.handles = uploaded;
             return ready();
