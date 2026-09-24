@@ -16,10 +16,10 @@ import java.util.Map;
 import java.util.Objects;
 
 /** 库提供的一次性几何收集出口；同材质／拓扑的顶点自动合并，不接触 GPU。 */
-public final class GeometryCollector {
+public class GeometryCollector {
     /** 捕获结果的材质／拓扑分组键，仅为内部数据。 */
-    record Pass(RenderType material, VertexFormat.Mode mode) {
-        Pass {
+    public record Pass(RenderType material, VertexFormat.Mode mode) {
+        public Pass {
             Objects.requireNonNull(material, "material");
             if (mode != VertexFormat.Mode.QUADS && mode != VertexFormat.Mode.TRIANGLES) {
                 throw new IllegalArgumentException("Unsupported geometry mode: " + mode);
@@ -28,7 +28,7 @@ public final class GeometryCollector {
     }
     private final Map<Pass, MeshSink> meshes = new LinkedHashMap<>();
 
-    GeometryCollector() {}
+    public GeometryCollector() {}
 
     /** 单个 pass 的 UV2 须全部为 0 或全部固定非零；混合时使用双材质重载。 */
     public VertexConsumer buffer(RenderType material, VertexFormat.Mode mode) {
@@ -68,10 +68,10 @@ public final class GeometryCollector {
         return true;
     }
 
-    Map<Pass, MeshSink> snapshot() {
+    public Map<Pass, MeshSink> snapshot() {
         Map<Pass, MeshSink> result = new LinkedHashMap<>();
         this.meshes.forEach((pass, mesh) -> { if (!mesh.isEmpty()) result.put(pass, mesh); });
         return result;
     }
-    void clear() { this.meshes.clear(); }
+    public void clear() { this.meshes.clear(); }
 }

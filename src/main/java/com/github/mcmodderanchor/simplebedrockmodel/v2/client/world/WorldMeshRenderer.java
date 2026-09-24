@@ -57,7 +57,7 @@ import java.util.concurrent.CompletableFuture;
  */
 @OnlyIn(Dist.CLIENT)
 @Mod.EventBusSubscriber(modid = SimpleBedrockModel.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
-public final class WorldMeshRenderer {
+public class WorldMeshRenderer {
     private static final int MAX_SAMPLERS = 12;
 
     /** 光照的 attribute 位置：{@code VertexFormat} 元素列表序号（NEW_ENTITY 里是 UV2）。 */
@@ -356,7 +356,7 @@ public final class WorldMeshRenderer {
     }
 
     /** 用最小代价问一次"当前生效的顶点格式"：构造 1 个 quad 再丢弃，不碰 GL。 */
-    static VertexFormat probeFormat() {
+    public static VertexFormat probeFormat() {
         BufferBuilder probe = new BufferBuilder(1024);
         probe.begin(VertexFormat.Mode.QUADS, MeshSink.FORMAT);
         for (int i = 0; i < 4; i++) {
@@ -618,7 +618,6 @@ public final class WorldMeshRenderer {
                         GL30.glVertexAttribI2i(LIGHT_ATTRIBUTE_INDEX,
                                 light & 0xFFFF, light >>> 16);
                     } else {
-                        // 重挂是正确性要求（不是探针）：几何上传与池复用都会把 attribute 4 冲掉。
                         if (!handle.isLightStreamAttached() && !attachLightStream(handle)) {
                             index = end;
                             continue;
@@ -705,7 +704,7 @@ public final class WorldMeshRenderer {
      * 每个 RenderType 只做一次：共享 uniform + 一次 {@code apply()}。
      * 逐 shard 上传 ModelViewMat；局部朝向改变时同步方向光，再 bind、draw。
      */
-    static void uploadSharedUniforms(ShaderInstance shader, Matrix4f baseView, Matrix4f projection) {
+    public static void uploadSharedUniforms(ShaderInstance shader, Matrix4f baseView, Matrix4f projection) {
         for (int i = 0; i < MAX_SAMPLERS; i++) {
             shader.setSampler("Sampler" + i, RenderSystem.getShaderTexture(i));
         }

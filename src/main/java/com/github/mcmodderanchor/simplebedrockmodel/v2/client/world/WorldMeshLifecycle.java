@@ -12,7 +12,7 @@ import org.jetbrains.annotations.ApiStatus;
 /** 资源重载的 apply 阶段运行于客户端主线程；世界卸载监听由渲染器的注解订阅器处理。 */
 @ApiStatus.Internal
 @Mod.EventBusSubscriber(modid = SimpleBedrockModel.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.MOD)
-public final class WorldMeshLifecycle {
+public class WorldMeshLifecycle {
     private WorldMeshLifecycle() {
     }
 

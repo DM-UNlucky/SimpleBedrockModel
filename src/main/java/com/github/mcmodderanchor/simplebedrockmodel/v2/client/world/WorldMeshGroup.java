@@ -18,7 +18,7 @@ import java.util.Set;
  * 库管理的世界网格渲染组。直接登记业务对象或其适配器，遍历时通过回调获取有效性与最新状态。
  * 全部方法在渲染线程调用。世界原点与局部实例矩阵独立于共享几何。
  */
-public final class WorldMeshGroup<T> implements AutoCloseable {
+public class WorldMeshGroup<T> implements AutoCloseable {
     @FunctionalInterface
     interface ShardSink {
         void accept(ShardHandle handle, Vec3 origin, Matrix4f localTransform, AABB worldBounds, int packedLight);

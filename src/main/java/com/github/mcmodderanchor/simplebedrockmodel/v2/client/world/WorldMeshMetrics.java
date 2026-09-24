@@ -1,7 +1,7 @@
 package com.github.mcmodderanchor.simplebedrockmodel.v2.client.world;
 
 /** 渲染线程上的可变计数与帧采样；对外只返回不可变的 {@link WorldMeshStats} 快照。 */
-public final class WorldMeshMetrics {
+public class WorldMeshMetrics {
     private static final int FRAME_SAMPLES = 120;
 
     private int submits;

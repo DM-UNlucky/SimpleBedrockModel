@@ -6,7 +6,7 @@ import org.joml.Matrix4f;
 import org.joml.Vector3f;
 
 /** 局部网格包围盒转成世界包围盒，供 INSTANCE 视锥剔除。 */
-public final class WorldMeshTransforms {
+public class WorldMeshTransforms {
     private WorldMeshTransforms() {}
 
     public static AABB bounds(AABB local, Matrix4f transform, Vec3 origin) {

@@ -39,7 +39,7 @@ import java.util.concurrent.CompletableFuture;
  */
 @OnlyIn(Dist.CLIENT)
 @Mod.EventBusSubscriber(modid = SimpleBedrockModel.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
-public final class ImmediateStaticMeshRenderer {
+public class ImmediateStaticMeshRenderer {
     public enum DrawResult { DRAWN, PENDING, UNSUPPORTED }
 
     @FunctionalInterface

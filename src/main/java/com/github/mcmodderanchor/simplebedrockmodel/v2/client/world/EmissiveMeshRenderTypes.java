@@ -11,13 +11,13 @@ import net.minecraft.resources.ResourceLocation;
 import java.util.function.Function;
 
 /** 带深度和 alpha 裁剪的发光材质；shader 不使用法线方向计算明暗。 */
-public final class EmissiveMeshRenderTypes extends RenderStateShard {
+public class EmissiveMeshRenderTypes extends RenderStateShard {
     private static final Function<ResourceLocation, RenderType> QUADS =
             Util.memoize(texture -> create(texture, VertexFormat.Mode.QUADS));
     private static final Function<ResourceLocation, RenderType> TRIANGLES =
             Util.memoize(texture -> create(texture, VertexFormat.Mode.TRIANGLES));
 
-    private EmissiveMeshRenderTypes(String name, Runnable setup, Runnable clear) {
+    public EmissiveMeshRenderTypes(String name, Runnable setup, Runnable clear) {
         super(name, setup, clear);
     }
 

@@ -23,7 +23,7 @@ import org.joml.Vector3f;
  * 变换到局部空间；SECTION 拼接时把法线变换到世界空间。</p>
  */
 @OnlyIn(Dist.CLIENT)
-public final class MeshSink implements VertexConsumer {
+public class MeshSink implements VertexConsumer {
     public static final VertexFormat FORMAT = DefaultVertexFormat.NEW_ENTITY;
     public static final int VERTEX_STRIDE_BYTES = FORMAT.getVertexSize();
 

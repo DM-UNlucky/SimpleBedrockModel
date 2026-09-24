@@ -18,7 +18,7 @@ import java.util.Map;
  * 不接入地形 chunk layer，不进行 VBO 子分配，也不承担透明排序。
  */
 @OnlyIn(Dist.CLIENT)
-public final class SectionMeshBatches<K> {
+public class SectionMeshBatches<K> {
     private static final int MAX_BUILDS_PER_FRAME = 4;
     // 软预算：不在单个模型/批次内部中断，所以一个超大批次仍可能超时。
     private static final long BUILD_BUDGET_NANOS = 2_000_000L;
