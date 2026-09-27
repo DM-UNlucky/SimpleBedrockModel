@@ -58,6 +58,8 @@ public class FirstPersonParticleSystem {
      * 添加一个粒子效果发射器并标记其归属手。
      * <p>
      * 发射器产出的世界空间粒子会自动投递到原版 ParticleEngine，
+     * 并默认启用第一人称 FOV 补偿；调用方可通过
+     * {@link ParticleEmitterInstance#setFovCompensatedWorldParticles(boolean)} 关闭。
      * 局部空间粒子留在内部列表由本系统管理。归属手仅用于 {@link #stopEmitters(InteractionHand)}
      * 按手停止产出，不影响 tick / render（两手统一处理）。
      *
@@ -65,6 +67,7 @@ public class FirstPersonParticleSystem {
      */
     public ParticleEmitterInstance addEmitter(ParticleEffectDefinition definition, InteractionHand hand) {
         ParticleEmitterInstance emitter = new ParticleEmitterInstance(definition, molang);
+        emitter.setFovCompensatedWorldParticles(true);
 
         // 启用第一人称模式（检查 sbm:fp_emitter_local_space 组件）
         emitter.enableFPMode();

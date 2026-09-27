@@ -68,6 +68,8 @@ public class ParticleEmitterInstance {
 
     /** 投递到世界空间的粒子（worldSpace=true）的尺寸/初速度附加缩放，默认 1。 */
     private float worldParticleScale = 1.0f;
+    /** Whether world particles should keep their first-person screen size across FOV changes. */
+    private boolean fovCompensatedWorldParticles;
 
     private final Map<String, ParticleCurve> curves;
 
@@ -356,6 +358,9 @@ public class ParticleEmitterInstance {
      */
     public void setWorldParticleScale(float scale) { this.worldParticleScale = scale; }
     public float getWorldParticleScale() { return worldParticleScale; }
+
+    public void setFovCompensatedWorldParticles(boolean enabled) { this.fovCompensatedWorldParticles = enabled; }
+    public boolean isFovCompensatedWorldParticles() { return fovCompensatedWorldParticles; }
 
     public void setLocalSpaceFlags(boolean pos, boolean rot, boolean vel) {
         this.localPosition = pos;

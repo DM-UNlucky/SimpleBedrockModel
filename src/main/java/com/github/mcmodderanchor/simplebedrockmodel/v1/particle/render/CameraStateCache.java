@@ -63,4 +63,11 @@ public final class CameraStateCache {
         }
         return (float) (handTan / worldTan);
     }
+
+    /** Current world-particle size multiplier for matching the hand projection. */
+    public static float getWorldParticleScale() {
+        float handToWorld = getFirstPersonToWorldDepthScale();
+        return Float.isFinite(handToWorld) && handToWorld > 1.0e-4f
+                ? 1.0f / handToWorld : 1.0f;
+    }
 }
