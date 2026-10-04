@@ -17,6 +17,7 @@ import net.minecraft.client.renderer.chunk.ChunkRenderDispatcher;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.api.distmarker.OnlyIn;
 import net.minecraftforge.event.level.LevelEvent;
+import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import org.joml.Matrix4f;
@@ -25,7 +26,7 @@ import org.joml.Vector3f;
 import org.lwjgl.opengl.GL30;
 
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,7 +41,11 @@ import java.util.concurrent.CompletableFuture;
 @OnlyIn(Dist.CLIENT)
 @Mod.EventBusSubscriber(modid = SimpleBedrockModel.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class ImmediateStaticMeshRenderer {
-    public enum DrawResult { DRAWN, PENDING, UNSUPPORTED }
+    public enum DrawResult {
+        DRAWN, DRAWN_PREVIOUS, PENDING, UNSUPPORTED;
+
+        public boolean drawn() { return this == DRAWN || this == DRAWN_PREVIOUS; }
+    }
 
     @FunctionalInterface
     public interface GeometryProvider {
@@ -52,12 +57,13 @@ public class ImmediateStaticMeshRenderer {
     private static final int FORMAT_CHECK_DRAWS = 60;
     private static final VertexBufferPool POOL = new VertexBufferPool();
     private static final Map<Object, Entry> CACHE = new LinkedHashMap<>(16, 0.75F, true);
+    private static final IdleMeshCache<Object, Entry> IDLE = new IdleMeshCache<>(MAX_ENTRIES, MAX_BYTES,
+            System::nanoTime, ImmediateStaticMeshRenderer::discard);
 
     private static ClientLevel level;
     private static VertexFormat probedFormat;
     private static int formatCheckCountdown = FORMAT_CHECK_DRAWS;
     private static long generation;
-    private static long cachedBytes;
     private static long captureWindow = Long.MIN_VALUE;
     private static int capturesInWindow;
     private static long captureNanosInWindow;
@@ -80,11 +86,15 @@ public class ImmediateStaticMeshRenderer {
     }
 
     private static final class Entry {
+        final Object key;
+        int references;
         List<Part> parts;
         long bytes;
         long retryAtNanos;
         int failures;
         boolean unsupported;
+
+        Entry(Object key) { this.key = key; }
 
         boolean ready() {
             return parts != null && !parts.isEmpty()
@@ -104,11 +114,28 @@ public class ImmediateStaticMeshRenderer {
      */
     public static DrawResult tryDraw(Object key, GeometryProvider provider, PoseStack pose,
                                      int packedLight, int packedOverlay, Runnable beforeDraw) {
+        return tryDraw(key, null, provider, pose, packedLight, packedOverlay, beforeDraw,
+                MeshCachePolicy.DEFAULT.idleRetention());
+    }
+
+    /**
+     * Prepares the target, then draws it or the caller's exact compatible previous key.
+     * The previous key is looked up only; it is never captured as a fallback. DRAWN_PREVIOUS lets
+     * the caller align dynamic effects with the mesh actually drawn. PENDING still owns the call.
+     * Retention starts at the last draw/prepare call; zero disables idle retention. Active entries
+     * are pinned, with at most 128 / 256 MiB of estimated vertex data retained in the idle LRU.
+     */
+    public static DrawResult tryDraw(Object key, Object previousKey, GeometryProvider provider, PoseStack pose,
+                                     int packedLight, int packedOverlay, Runnable beforeDraw,
+                                     Duration idleRetention) {
         RenderSystem.assertOnRenderThread();
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(provider, "provider");
         Objects.requireNonNull(pose, "pose");
         Objects.requireNonNull(beforeDraw, "beforeDraw");
+        Objects.requireNonNull(idleRetention, "idleRetention");
+        if (idleRetention.isNegative()) throw new IllegalArgumentException("Negative idle retention");
+        idleRetention.toNanos();
         ClientLevel current = Minecraft.getInstance().level;
         if (current == null) return DrawResult.UNSUPPORTED;
         if (current != level) {
@@ -124,8 +151,45 @@ public class ImmediateStaticMeshRenderer {
             if (format != null) probedFormat = format;
         }
 
-        Entry entry = CACHE.computeIfAbsent(key, ignored -> new Entry());
-        trim(key);
+        IDLE.evictExpired();
+        Entry entry = acquire(key);
+        Entry previous = previousKey == null || previousKey.equals(key) ? null : CACHE.get(previousKey);
+        if (previous != null) pin(previous);
+        try {
+            DrawResult result = tryDrawTarget(entry, provider, pose, packedLight, packedOverlay, beforeDraw);
+            if (result.drawn() || previous == null || !previous.ready() || !layoutSupported(previous)) return result;
+            // Failed draw calls may have submitted some parts: only reuse another mesh before any draw.
+            if (entry.ready() && !entry.unsupported && layoutSupported(entry)) return result;
+            beforeDraw.run();
+            return draw(previous, pose, packedLight, packedOverlay) ? DrawResult.DRAWN_PREVIOUS : DrawResult.PENDING;
+        } finally {
+            releaseEntry(entry, idleRetention);
+            if (previous != null) releaseEntry(previous, idleRetention);
+        }
+    }
+
+    private static Entry acquire(Object key) {
+        Entry entry = CACHE.computeIfAbsent(key, Entry::new);
+        pin(entry);
+        return entry;
+    }
+
+    private static void pin(Entry entry) {
+        IDLE.remove(entry.key);
+        entry.references++;
+    }
+
+    private static void releaseEntry(Entry entry, Duration idleRetention) {
+        if (--entry.references == 0) IDLE.retain(entry.key, entry, entry.bytes, idleRetention);
+    }
+
+    private static void discard(Entry entry) {
+        CACHE.remove(entry.key, entry);
+        retire(entry, true);
+    }
+
+    private static DrawResult tryDrawTarget(Entry entry, GeometryProvider provider, PoseStack pose,
+                                            int packedLight, int packedOverlay, Runnable beforeDraw) {
         if (entry.unsupported) return DrawResult.UNSUPPORTED;
         if (entry.failed()) {
             retire(entry, true);
@@ -136,7 +200,7 @@ public class ImmediateStaticMeshRenderer {
             long now = System.nanoTime();
             if (now < entry.retryAtNanos || !captureBudgetAvailable(now)) return DrawResult.PENDING;
             long start = System.nanoTime();
-            boolean captured = capture(entry, key, provider);
+            boolean captured = capture(entry, entry.key, provider);
             capturesInWindow++;
             captureNanosInWindow += System.nanoTime() - start;
             if (!captured) {
@@ -144,7 +208,6 @@ public class ImmediateStaticMeshRenderer {
                 entry.retryAtNanos = System.nanoTime() + retryDelay(entry.failures++);
                 return DrawResult.PENDING;
             }
-            trim(key);
         }
         if (!entry.ready()) return DrawResult.PENDING;
         if (!layoutSupported(entry)) return DrawResult.UNSUPPORTED;
@@ -211,7 +274,6 @@ public class ImmediateStaticMeshRenderer {
             entry.parts = parts;
             entry.bytes = bytes;
             entry.failures = 0;
-            cachedBytes += bytes;
             return true;
         } catch (RuntimeException exception) {
             parts.forEach(part -> release(part, generation, true));
@@ -289,20 +351,8 @@ public class ImmediateStaticMeshRenderer {
         uniform.upload();
     }
 
-    private static void trim(Object current) {
-        Iterator<Map.Entry<Object, Entry>> iterator = CACHE.entrySet().iterator();
-        while ((CACHE.size() > MAX_ENTRIES || cachedBytes > MAX_BYTES) && iterator.hasNext()) {
-            Map.Entry<Object, Entry> eldest = iterator.next();
-            if (eldest.getKey().equals(current)) continue;
-            iterator.remove();
-            // Evicted GPU storage is closed after upload, so the byte cap includes idle memory.
-            retire(eldest.getValue(), true);
-        }
-    }
-
     private static void retire(Entry entry, boolean invalidated) {
         if (entry.parts == null) return;
-        cachedBytes -= entry.bytes;
         long retiringGeneration = generation;
         for (Part part : entry.parts) release(part, retiringGeneration, invalidated);
         entry.parts = null;
@@ -321,6 +371,11 @@ public class ImmediateStaticMeshRenderer {
                 RenderSystem.recordRenderCall(action::run);
             }
         });
+    }
+
+    @SubscribeEvent
+    public static void onClientTick(TickEvent.ClientTickEvent event) {
+        if (event.phase == TickEvent.Phase.END) IDLE.evictExpired();
     }
 
     @SubscribeEvent
@@ -343,11 +398,11 @@ public class ImmediateStaticMeshRenderer {
     public static void clear() {
         RenderSystem.assertOnRenderThread();
         generation++;
+        IDLE.clear();
         for (Entry entry : CACHE.values()) {
             retire(entry, true);
         }
         CACHE.clear();
-        cachedBytes = 0;
         POOL.clear();
         probedFormat = null;
         formatCheckCountdown = FORMAT_CHECK_DRAWS;

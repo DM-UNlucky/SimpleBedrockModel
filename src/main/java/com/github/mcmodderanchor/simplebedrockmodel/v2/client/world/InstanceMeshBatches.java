@@ -13,13 +13,13 @@ import java.util.IdentityHashMap;
 import java.util.function.Predicate;
 
 /** 逐实例绘制与共享几何换版；消费者无需持有句柄或引用计数。 */
-final class InstanceMeshBatches<K> {
+public class InstanceMeshBatches<K> {
     private final GeometryCache cache;
     private int preparationCursor;
     private final Map<K, Resident> residents = new LinkedHashMap<>();
     private static final class Resident {
-        GeometryCache.Entry active;
-        GeometryCache.Entry pending;
+        final MeshSwap<GeometryCache.Entry> meshes = new MeshSwap<>(GeometryCache.Entry::ready,
+                GeometryCache.Entry::release);
         Vec3 origin;
         Matrix4f localTransform;
         int light;
@@ -34,25 +34,29 @@ final class InstanceMeshBatches<K> {
         resident.origin = origin;
         resident.localTransform = localTransform;
         resident.light = light;
-        GeometryCache.Entry current = resident.pending == null ? resident.active : resident.pending;
+        GeometryCache.Entry active = resident.meshes.active();
+        if (active != null && active.key.equals(geometryKey)) {
+            resident.meshes.cancelPending();
+            return;
+        }
+        GeometryCache.Entry current = resident.meshes.pending();
         if (current != null && current.key.equals(geometryKey)) return;
         GeometryCache.Entry next = this.cache.acquire(geometryKey);
-        if (resident.pending != null) resident.pending.release();
-        resident.pending = next;
+        resident.meshes.request(next);
     }
 
     void remove(K id) {
         Resident resident = this.residents.remove(id);
         if (resident == null) return;
-        if (resident.active != null) resident.active.release();
-        if (resident.pending != null) resident.pending.release();
+        resident.meshes.clear();
     }
 
     void prepare(WorldMeshGroup<?> owner) {
         long start = System.nanoTime();
         Set<GeometryCache.Entry> waiting = new LinkedHashSet<>();
         for (Resident resident : this.residents.values()) {
-            if (resident.pending != null && resident.pending.captured() && !resident.pending.queued()) waiting.add(resident.pending);
+            GeometryCache.Entry pending = resident.meshes.pending();
+            if (pending != null && pending.captured() && !pending.queued()) waiting.add(pending);
         }
         List<GeometryCache.Entry> jobs = new ArrayList<>(waiting);
         if (!jobs.isEmpty()) {
@@ -67,27 +71,24 @@ final class InstanceMeshBatches<K> {
         }
         // 就绪提升不受重建预算限制；缺失资源的重试轮转，避免阻塞其它模型。
         for (Resident resident : this.residents.values()) {
-            if (resident.pending != null && resident.pending.ready()) {
-                if (resident.active != null) resident.active.release();
-                resident.active = resident.pending;
-                resident.pending = null;
-                resident.worldBounds.clear();
-            }
+            if (resident.meshes.promote()) resident.worldBounds.clear();
         }
     }
 
     boolean ready(K id, Object geometryKey) {
         Resident resident = this.residents.get(id);
-        return resident != null && resident.active != null && resident.active.key.equals(geometryKey)
-                && resident.active.ready() && !resident.active.handles().isEmpty();
+        GeometryCache.Entry active = resident == null ? null : resident.meshes.active();
+        return active != null && active.key.equals(geometryKey)
+                && active.ready() && !active.handles().isEmpty();
     }
 
     void collect(WorldMeshGroup.ShardSink out, Predicate<K> eligible) {
         for (Map.Entry<K, Resident> entry : this.residents.entrySet()) {
             if (!eligible.test(entry.getKey())) continue;
             Resident resident = entry.getValue();
-            if (resident.active == null) continue;
-            for (ShardHandle handle : resident.active.handles()) {
+            GeometryCache.Entry active = resident.meshes.active();
+            if (active == null) continue;
+            for (ShardHandle handle : active.handles()) {
                 out.accept(handle, resident.origin, resident.localTransform,
                         resident.worldBounds.computeIfAbsent(handle, h -> WorldMeshTransforms.bounds(
                                 h.localBounds(), resident.localTransform, resident.origin)), resident.light);
@@ -97,8 +98,7 @@ final class InstanceMeshBatches<K> {
 
     void clear() {
         for (Resident resident : this.residents.values()) {
-            if (resident.active != null) resident.active.release();
-            if (resident.pending != null) resident.pending.release();
+            resident.meshes.clear();
         }
         this.residents.clear();
         this.preparationCursor = 0;

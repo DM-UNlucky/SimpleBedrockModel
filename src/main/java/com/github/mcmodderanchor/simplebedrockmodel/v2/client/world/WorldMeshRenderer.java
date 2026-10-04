@@ -146,9 +146,15 @@ public class WorldMeshRenderer {
     /** 在渲染线程创建渲染组；同 ID 不允许重复创建，关闭后可重新创建。 */
     public static <K> WorldMeshGroup<K> createGroup(String id, WorldMeshStrategy defaultStrategy,
                                                 Set<WorldMeshStrategy> supported) {
+        return createGroup(id, defaultStrategy, supported, MeshCachePolicy.DEFAULT);
+    }
+
+    /** LRU limits apply to idle geometry; live active/pending references remain pinned. */
+    public static <K> WorldMeshGroup<K> createGroup(String id, WorldMeshStrategy defaultStrategy,
+                                                Set<WorldMeshStrategy> supported, MeshCachePolicy cachePolicy) {
         RenderSystem.assertOnRenderThread();
         if (MESH_GROUPS.containsKey(id)) throw new IllegalArgumentException("Duplicate group: " + id);
-        WorldMeshGroup<K> group = new WorldMeshGroup<>(id, defaultStrategy, supported);
+        WorldMeshGroup<K> group = new WorldMeshGroup<>(id, defaultStrategy, supported, cachePolicy);
         MESH_GROUPS.put(id, group);
         group.applyPolicy();
         return group;
@@ -376,6 +382,15 @@ public class WorldMeshRenderer {
         RenderSystem.assertOnRenderThread();
         if (!handle.retire()) return;
         SHARDS.remove(handle);
+        METRICS.recordRelease();
+        recycleWhenUploaded(handle);
+    }
+
+    /** LRU/TTL eviction frees GPU storage rather than moving it into the unbounded buffer pool. */
+    static void discard(ShardHandle handle) {
+        RenderSystem.assertOnRenderThread();
+        if (!SHARDS.remove(handle)) return;
+        handle.kill();
         METRICS.recordRelease();
         recycleWhenUploaded(handle);
     }

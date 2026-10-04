@@ -6,19 +6,32 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.LongSupplier;
 
 /** 保存共享几何、捕获任务和 GPU 所有权；不调用业务对象或回调渲染组。 */
-final class GeometryCache {
+public class GeometryCache {
     private final Map<Object, Entry> entries = new HashMap<>();
     private final ArrayDeque<Entry> captureQueue = new ArrayDeque<>();
+    private final MeshCachePolicy policy;
+    private final IdleMeshCache<Object, Entry> idle;
     private long captures;
     private long failures;
+
+    GeometryCache() { this(MeshCachePolicy.DEFAULT); }
+
+    GeometryCache(MeshCachePolicy policy) { this(policy, System::nanoTime); }
+
+    GeometryCache(MeshCachePolicy policy, LongSupplier clock) {
+        this.policy = policy;
+        this.idle = new IdleMeshCache<>(policy.maxIdleEntries(), policy.maxIdleBytes(), clock, this::discard);
+    }
 
     final class Entry {
         final Object key;
         private int references;
         private Map<GeometryCollector.Pass, MeshSink> meshes;
         private List<ShardHandle> handles;
+        private boolean captureQueued;
 
         Entry(Object key) { this.key = key; }
         boolean captured() { return this.meshes != null; }
@@ -61,28 +74,47 @@ final class GeometryCache {
         boolean queued() { return this.handles != null && this.handles.stream().allMatch(h -> h.isAlive() && !h.uploadFailed()); }
 
         void release() {
+            if (this.references <= 0) throw new IllegalStateException("Geometry already released");
             if (--this.references == 0) {
-                closeHandles();
-                entries.remove(this.key, this);
+                long bytes = this.meshes == null ? 0 : this.meshes.values().stream()
+                        .mapToLong(mesh -> mesh.estimatedBytes()).sum();
+                idle.retain(this.key, this, bytes, policy.idleRetention());
             }
         }
         private void closeHandles() {
+            closeHandles(false);
+        }
+        private void closeHandles(boolean discardStorage) {
             if (this.handles != null) {
-                this.handles.forEach(ShardHandle::release);
+                if (discardStorage) this.handles.forEach(WorldMeshRenderer::discard);
+                else this.handles.forEach(ShardHandle::release);
                 this.handles = null;
             }
         }
     }
 
     Entry acquire(Object key) {
+        this.idle.evictExpired();
+        this.idle.remove(key);
         Entry entry = this.entries.get(key);
         if (entry == null) {
             entry = new Entry(key);
             this.entries.put(key, entry);
-            this.captureQueue.addLast(entry);
         }
         entry.references++;
+        enqueueCapture(entry);
         return entry;
+    }
+
+    private void enqueueCapture(Entry entry) {
+        if (entry.captured() || entry.captureQueued) return;
+        entry.captureQueued = true;
+        this.captureQueue.addLast(entry);
+    }
+
+    private void discard(Entry entry) {
+        entry.closeHandles(true);
+        this.entries.remove(entry.key, entry);
     }
 
     int pendingCaptures() { return this.captureQueue.size(); }
@@ -90,7 +122,8 @@ final class GeometryCache {
     Entry pollCapture() {
         Entry entry;
         while ((entry = this.captureQueue.pollFirst()) != null) {
-            if (entry.references > 0 && !entry.captured()) return entry;
+            entry.captureQueued = false;
+            if (entry.references > 0 && this.entries.get(entry.key) == entry && !entry.captured()) return entry;
         }
         return null;
     }
@@ -103,12 +136,17 @@ final class GeometryCache {
             this.captures++;
         } else {
             this.failures++;
-            this.captureQueue.addLast(entry);
+            enqueueCapture(entry);
         }
     }
 
-    public void discardReleasedCaptures() {
-        this.captureQueue.removeIf(entry -> entry.references == 0);
+    void evictExpired() { this.idle.evictExpired(); }
+
+    void clear() {
+        this.idle.clear();
+        for (Entry entry : this.entries.values()) entry.closeHandles(true);
+        this.entries.clear();
+        this.captureQueue.clear();
     }
 
     public int size() {

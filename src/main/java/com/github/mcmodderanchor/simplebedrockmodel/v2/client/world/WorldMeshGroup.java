@@ -83,6 +83,7 @@ public class WorldMeshGroup<T> implements AutoCloseable {
         boolean explicitDraw;
         long claimedDrawSerial = Long.MIN_VALUE;
         Object claimedGeometryKey;
+        Object claimedPreviousGeometryKey;
 
         Entry(T object, MeshRenderableAdapter<? super T> adapter) {
             this.object = object;
@@ -99,25 +100,36 @@ public class WorldMeshGroup<T> implements AutoCloseable {
     private String warnings = "";
     private final Map<T, Entry> objects = new IdentityHashMap<>();
     private final List<Entry> traversal = new ArrayList<>();
-    private final GeometryCache cache = new GeometryCache();
-    private final InstanceMeshBatches<Entry> instances = new InstanceMeshBatches<>(this.cache);
-    private final SectionMeshBatches<Entry> sections = new SectionMeshBatches<>(this.cache);
+    private final MeshCachePolicy cachePolicy;
+    private final GeometryCache cache;
+    private final InstanceMeshBatches<Entry> instances;
+    private final SectionMeshBatches<Entry> sections;
     private boolean populated;
     private boolean closed;
 
     WorldMeshGroup(String id, WorldMeshStrategy defaultStrategy, Set<WorldMeshStrategy> supported) {
+        this(id, defaultStrategy, supported, MeshCachePolicy.DEFAULT);
+    }
+
+    WorldMeshGroup(String id, WorldMeshStrategy defaultStrategy, Set<WorldMeshStrategy> supported,
+                   MeshCachePolicy cachePolicy) {
         this.id = Objects.requireNonNull(id, "id");
         if (id.isBlank()) throw new IllegalArgumentException("Empty mesh group id");
         this.defaultStrategy = Objects.requireNonNull(defaultStrategy, "defaultStrategy");
         this.supported = Set.copyOf(EnumSet.copyOf(supported));
         if (!this.supported.contains(defaultStrategy)) throw new IllegalArgumentException("Default strategy is unsupported");
         this.effectiveStrategy = defaultStrategy;
+        this.cachePolicy = Objects.requireNonNull(cachePolicy, "cachePolicy");
+        this.cache = new GeometryCache(cachePolicy);
+        this.instances = new InstanceMeshBatches<>(this.cache);
+        this.sections = new SectionMeshBatches<>(this.cache);
     }
 
     public String id() { return this.id; }
     public WorldMeshStrategy defaultStrategy() { return this.defaultStrategy; }
     public Set<WorldMeshStrategy> supportedStrategies() { return this.supported; }
     public WorldMeshStrategy effectiveStrategy() { return this.effectiveStrategy; }
+    public MeshCachePolicy cachePolicy() { return this.cachePolicy; }
 
     /** 对象需实现 MeshRenderable；同一对象重复登记不更换绑定，也不强制更新。 */
     public void track(T object) {
@@ -164,6 +176,16 @@ public class WorldMeshGroup<T> implements AutoCloseable {
      * 保留普通绘制。调用方应传入本帧实际外观对应的 key，不得只传上一帧快照。
      */
     public boolean claimForWorldDraw(T object, Object expectedGeometryKey) {
+        return claimForWorldDraw(object, expectedGeometryKey, null);
+    }
+
+    /**
+     * Allows an already uploaded previous variant to keep drawing while the target is prepared.
+     * The caller supplies an exact compatible key (e.g. the other LOD of the same appearance).
+     * Both keys must include resource/appearance revisions; null keeps the strict claim semantics.
+     * This never captures geometry synchronously or invokes an ordinary renderer.
+     */
+    public boolean claimForWorldDraw(T object, Object expectedGeometryKey, Object previousGeometryKey) {
         checkOpen();
         Objects.requireNonNull(expectedGeometryKey, "expectedGeometryKey");
         WorldMeshRenderer.ensureLevel();
@@ -172,9 +194,14 @@ public class WorldMeshGroup<T> implements AutoCloseable {
         entry.explicitDraw = true;
         entry.claimedDrawSerial = Long.MIN_VALUE;
         entry.claimedGeometryKey = null;
+        entry.claimedPreviousGeometryKey = null;
+        // Camera-driven changes must refresh this frame, even within the same client tick.
+        if (!expectedGeometryKey.equals(entry.geometryKey)) entry.dirtyRevision++;
         if (!WorldMeshRenderer.isEnabled() || this.effectiveStrategy != WorldMeshStrategy.INSTANCE
-                || !this.instances.ready(entry, expectedGeometryKey)) return false;
+                || !this.instances.ready(entry, expectedGeometryKey)
+                && (previousGeometryKey == null || !this.instances.ready(entry, previousGeometryKey))) return false;
         entry.claimedGeometryKey = expectedGeometryKey;
+        entry.claimedPreviousGeometryKey = previousGeometryKey;
         entry.claimedDrawSerial = WorldMeshRenderer.nextWorldDrawSerial();
         return true;
     }
@@ -320,7 +347,7 @@ public class WorldMeshGroup<T> implements AutoCloseable {
     private void clearCaches() {
         this.instances.clear();
         this.sections.clear();
-        this.cache.discardReleasedCaptures();
+        this.cache.clear();
         this.populated = false;
     }
 
@@ -345,6 +372,7 @@ public class WorldMeshGroup<T> implements AutoCloseable {
         // 阶段三：策略仅使用已捕获结果构建／上传网格。
         if (this.effectiveStrategy == WorldMeshStrategy.SECTION) this.sections.prepare(this);
         else this.instances.prepare(this);
+        this.cache.evictExpired();
     }
 
     void collect(ShardSink out) {
@@ -352,7 +380,9 @@ public class WorldMeshGroup<T> implements AutoCloseable {
         else this.instances.collect(out, entry -> !entry.explicitDraw
                 || entry.claimedDrawSerial == WorldMeshRenderer.currentWorldDrawSerial()
                 && entry.visible && entry.claimedGeometryKey.equals(entry.geometryKey)
-                && this.instances.ready(entry, entry.claimedGeometryKey));
+                && (this.instances.ready(entry, entry.claimedGeometryKey)
+                || entry.claimedPreviousGeometryKey != null
+                && this.instances.ready(entry, entry.claimedPreviousGeometryKey)));
     }
 
     public WorldMeshGroupStats stats() {
