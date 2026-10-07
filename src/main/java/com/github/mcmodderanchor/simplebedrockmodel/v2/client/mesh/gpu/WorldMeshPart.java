@@ -21,9 +21,8 @@ public class WorldMeshPart {
      * 这个 shard 的光照怎么给。
      *
      * <ul>
-     *   <li>{@link LightMode#FIXED}：所有顶点都是烘焙时的实际光照→ attribute 4 直接读几何 buffer；</li>
-     *   <li>{@link LightMode#UNIFORM}：所有顶点都跟随实例光照 → 整个 draw 是同一个值，用"关闭 attribute 数组 +
-     *       整型常量属性"，不需要任何光照缓冲；</li>
+     *   <li>{@link LightMode#FIXED}：所有顶点都是烘焙时的实际光照，UV2 直接读几何 buffer；</li>
+     *   <li>{@link LightMode#UNIFORM}：所有顶点都跟随实例光照，UV2 从共享整数参数表读取，divisor=1；</li>
      *   <li>{@link LightMode#MUTABLE}：实际光照独立存储，由调用方按顶点范围更新。</li>
      * </ul>
      */
@@ -48,13 +47,14 @@ public class WorldMeshPart {
     /** MUTABLE 光照流的 CPU 暂存内容。 */
     private final ByteBuffer lightScratch;
     private final LightMode lightMode;
+    private final MeshIntegerAttributes.LightState uniformLightState = new MeshIntegerAttributes.LightState();
     private final LightRangeUpdates lightUpdates;
 
     private boolean retired;
     private boolean dead;
     private boolean recycled;
     /**
-     * 本句柄的几何 VAO 上，attribute 4（UV2）是否已按本句柄的要求挂好。
+     * 本句柄的几何 VAO 上，固定／可变 UV2 是否已按实际上传格式挂好。
      *
      * <p>几何上传（{@code VertexBuffer.upload} 在格式变化时会重新 setupBufferState）与池回收复用
      * 都会让这个前置条件失效，所以标志必须挂在句柄上、初值为 false。</p>
@@ -124,6 +124,10 @@ public class WorldMeshPart {
 
     public LightMode lightMode() {
         return this.lightMode;
+    }
+
+    public MeshIntegerAttributes.LightState uniformLightState() {
+        return this.uniformLightState;
     }
 
     public int lightBufferId() {

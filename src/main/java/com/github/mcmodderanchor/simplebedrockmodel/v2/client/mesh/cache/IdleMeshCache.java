@@ -50,6 +50,17 @@ public class IdleMeshCache<K, V> {
         return idle.value();
     }
 
+    /** 内存准入压力下仅回收真正闲置的最旧条目。 */
+    public boolean evictOldest() {
+        Iterator<Idle<V>> iterator = entries.values().iterator();
+        if (!iterator.hasNext()) return false;
+        Idle<V> oldest = iterator.next();
+        iterator.remove();
+        bytes -= oldest.bytes();
+        dispose.accept(oldest.value());
+        return true;
+    }
+
     public void evictExpired() {
         long now = clock.getAsLong();
         Iterator<Idle<V>> iterator = entries.values().iterator();

@@ -4,7 +4,7 @@
 
 `StaticMeshRenderer.openBatch(owner, order)` 提供显式、限于当前渲染 pass 的命令缓冲。每次 `submit()` 复制当前 `RenderSystem modelView × PoseStack` 和实例方向光所需的逆线性变换，保存 light/overlay，并持有选中的缓存条目，直到 `flush()`、`endBatch()` 或 `close()`。
 
-默认 `SUBMISSION` 保持提交及 Part 顺序，只合并相邻的相同材质。显式 `MATERIAL` 按 RenderType、网格分组，一组材质只 setup/apply/clear 一次，同一网格只 bind 一次，每个实例仍单独 draw。它没有加入 instancing，也没有降低实例的 draw 数。
+默认 `SUBMISSION` 保持提交及 Part 顺序，合并相邻的相同材质。显式 `MATERIAL` 按 RenderType、网格分组，一组材质 setup/apply/clear 一次，同一网格连续绘制期间 bind 一次，每个实例单独 draw。
 
 ## 测试指令
 
@@ -71,6 +71,6 @@ CPU 计时包含姿势处理、命令收集、分组、绘制和释放引用。�
 
 队列由 pass 所有者控制：须在 framebuffer、投影、共享 shader 参数（包括方向光）及光影实体上下文变化前提交。完整矩阵副本允许调用者立即 pop/reuse PoseStack；其他共享状态沿用当前 pass。世界、GL 上下文、投影或网格代次变化时旧队列会取消；单项网格失效也会在 flush 前剔除。`close()` / `discard()` 只取消，`flush()` 排空后继续接受提交，`endBatch()` 执行最后一次排空后关闭队列。资源失效后的条目释放不会重新进入当前缓存。
 
-需要协调原版顺序时，由 pass 所有者在明确边界直接提交原版缓冲并调用网格 flush。`isCurrent` 只验证所属 pass 身份；没有 beforeFlush 回调。透明或其他顺序敏感材质需要正确的排序/提交边界，不能直接使用 `MATERIAL`。`QUEUED_PREVIOUS` 在入队时说明实际选择的兼容旧 LOD，供调用方生成对应动态效果。flush 抛异常时可能已经绘制部分 Part，同一次 pass 不应再运行模型 fallback。
+需要协调原版顺序时，由 pass 所有者在明确边界提交原版缓冲并排空网格。`isCurrent` 验证所属 pass 身份。顺序敏感材质由调用方安排排序和提交边界；`QUEUED_PREVIOUS` 标识选中的兼容旧 LOD，供动态效果使用。绘制异常时完成清理并取消余下命令，本次保持 VBO 接管，后续调用重新准备。
 
-原有矩阵快照测试随包名迁移，本轮不新增单元测试。隐藏 GL 窗口的整数属性检查：后者在同一次 begin/end 属性作用域内连续绘制 32 次，读取像素验证变化的 light/overlay 与固定发光 UV2。游戏内外观一致性、实际性能和光影兼容需要用以上场景继续验收。
+原有矩阵快照测试随包名迁移。隐藏 GL 整数属性检查在同一次 begin/end 作用域内连续绘制 32 次，读取像素验证变化的 light/overlay 与固定发光 UV2。游戏内外观、性能和光影表现通过上述场景验收。

@@ -16,7 +16,7 @@ import net.minecraft.client.renderer.chunk.ChunkRenderDispatcher;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL15;
-import org.lwjgl.opengl.GL30;
+import org.lwjgl.opengl.GL;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -28,8 +28,8 @@ import java.util.concurrent.CompletableFuture;
 
 /** 管理世界网格的 GPU 所有权和可变光照流；阶段调度由世界渲染入口负责。 */
 public class WorldMeshBuffers {
-    private static final int LIGHT_ATTRIBUTE_INDEX = 4;
     private final WorldMeshMetrics metrics;
+    private final MeshIntegerAttributes integerAttributes = new MeshIntegerAttributes();
     private final List<WorldMeshPart> parts = new ArrayList<>();
     public final VertexBufferPool pool = new VertexBufferPool();
     private long generation;
@@ -47,6 +47,7 @@ public class WorldMeshBuffers {
         generation++;
         dropAllHandles();
         pool.clear();
+        integerAttributes.close();
     }
 
     public void removeOwner(String ownerId) { dropHandlesOf(ownerId); }
@@ -54,8 +55,10 @@ public class WorldMeshBuffers {
     /** 在绑定几何 VAO 后调用；每组连续的相同网格与光照只执行一次。 */
     public boolean prepareDraw(WorldMeshPart part, int packedLight) {
         if (part.lightMode() == WorldMeshPart.LightMode.UNIFORM) {
-            GlStateManager._disableVertexAttribArray(LIGHT_ATTRIBUTE_INDEX);
-            GL30.glVertexAttribI2i(LIGHT_ATTRIBUTE_INDEX, packedLight & 0xFFFF, packedLight >>> 16);
+            if (!integerAttributes.supports(GL.getCapabilities(), packedLight, 0)
+                    || !integerAttributes.layoutSupported(part.uniformLightState(), part.buffer())
+                    || !integerAttributes.ensureReady()) return false;
+            integerAttributes.setupLight(part.uniformLightState(), MeshIntegerAttributes.parameterOffset(packedLight));
         } else {
             if (!part.isLightStreamAttached() && !attachLightStream(part)) return false;
             if (part.lightMode() == WorldMeshPart.LightMode.MUTABLE) flushLightUpdates(part);
@@ -173,6 +176,11 @@ public class WorldMeshBuffers {
     /** 几何 VAO 绑定后设置 UV2 来源；上传和池复用后的首次绘制必须重新设置。 */
     public boolean attachLightStream(WorldMeshPart handle) {
         int geometryBuffer = handle.buffer().vertexBufferId;
+        VertexFormat format = handle.buffer().getFormat();
+        if (format == null) return false;
+        int lightIndex = format.getElements().indexOf(DefaultVertexFormat.ELEMENT_UV2);
+        if (lightIndex < 0) return false;
+        VertexFormatElement element = format.getElements().get(lightIndex);
         int target;
         int stride;
         int offset;
@@ -181,17 +189,22 @@ public class WorldMeshBuffers {
             stride = 4;
             offset = 0;
         } else {
-            VertexFormat format = handle.buffer().getFormat();
-            if (format == null) return false;
             offset = findLightOffset(format);
             if (offset < 0) return false;
             target = geometryBuffer;
             stride = format.getVertexSize();
         }
-        GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, target);
-        GlStateManager._enableVertexAttribArray(LIGHT_ATTRIBUTE_INDEX);
-        GlStateManager._vertexAttribIPointer(LIGHT_ATTRIBUTE_INDEX, 2, GL11.GL_SHORT, stride, offset);
-        GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, geometryBuffer);
+        int previous = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
+        try {
+            GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, target);
+            GlStateManager._enableVertexAttribArray(lightIndex);
+            // 同格式的池复用不会自动恢复 divisor；固定／可变光照必须重新按顶点读取。
+            if (integerAttributes.supports(GL.getCapabilities(), 0, 0)) integerAttributes.divisor(lightIndex, 0);
+            GlStateManager._vertexAttribIPointer(lightIndex, handle.hasLightBuffer() ? 2 : element.getCount(),
+                    handle.hasLightBuffer() ? GL11.GL_SHORT : element.getType().getGlType(), stride, offset);
+        } finally {
+            GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, previous);
+        }
         handle.markLightStreamAttached();
         return true;
     }
@@ -254,7 +267,7 @@ public class WorldMeshBuffers {
         if (!handle.markRecycled()) {
             return;
         }
-        // 光照流缓冲随句柄一起回收。VAO 里可能还残留对它的引用（attribute 4 的绑定），
+        // 光照流缓冲随句柄一起回收。VAO 里可能还残留对它的引用（UV2 的绑定），
         // 但下一次使用这个几何 VAO 之前必定会重挂（新句柄的 lightStreamAttached 初值为 false），
         // 所以不会读到悬空的旧缓冲。
         if (handle.hasLightBuffer()) {

@@ -18,15 +18,19 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.RenderType;
-import net.minecraft.client.renderer.chunk.ChunkRenderDispatcher;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.api.distmarker.OnlyIn;
 import net.minecraftforge.event.level.LevelEvent;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
+import net.minecraftforge.eventbus.api.EventPriority;
 import net.minecraftforge.fml.common.Mod;
 import org.lwjgl.opengl.GL;
 import org.lwjgl.opengl.GLCapabilities;
+import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL15;
+import org.lwjgl.opengl.GL30;
+import com.mojang.blaze3d.platform.GlStateManager;
 
 import java.util.ArrayList;
 import java.time.Duration;
@@ -36,7 +40,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
-/** 临时共享几何的所有权、捕获预算、上传生命周期和按所有者失效。 */
+/** 共享静态几何的准备任务、帧预算、近期驻留与按所有者失效。 */
 @OnlyIn(Dist.CLIENT)
 @Mod.EventBusSubscriber(modid = SimpleBedrockModel.MOD_ID, value = Dist.CLIENT, bus = Mod.EventBusSubscriber.Bus.FORGE)
 public class StaticMeshCache {
@@ -47,17 +51,22 @@ public class StaticMeshCache {
     private static VertexBufferPool POOL = new VertexBufferPool();
     public static final MeshIntegerAttributes INTEGER_ATTRIBUTES = new MeshIntegerAttributes();
     public static final Map<CacheKey, Entry> CACHE = new LinkedHashMap<>(16, 0.75F, true);
-    private static final IdleMeshCache<CacheKey, Entry> IDLE = new IdleMeshCache<>(MAX_ENTRIES, MAX_BYTES,
-            System::nanoTime, StaticMeshCache::discard);
+    public static final MeshPreparationPolicy POLICY = MeshPreparationPolicy.DEFAULT;
+    private static final MeshPathFailures<ResourceLocation> FAILURES = new MeshPathFailures<>();
+    private static final MeshUploadQueue<Entry> UPLOADS = new MeshUploadQueue<>(POLICY, System::nanoTime);
+    private static final MeshCacheResidency<CacheKey, Entry> RESIDENCY = new MeshCacheResidency<>(
+            CACHE, MAX_ENTRIES, MAX_BYTES, System::nanoTime, entry -> entry.references,
+            Entry::preparing, entry -> entry.bytes, StaticMeshCache::discard);
 
     private static ClientLevel level;
     private static GLCapabilities geometryContext;
     private static VertexFormat probedFormat;
     private static int formatCheckCountdown = FORMAT_CHECK_DRAWS;
     public static long generation;
-    private static long captureWindow = Long.MIN_VALUE;
-    private static int capturesInWindow;
-    private static long captureNanosInWindow;
+    private static long frame;
+    private static int capturesInFrame;
+    private static long captureNanosInFrame, capturedBytesInFrame, capturesTotal;
+    private static long residentBytes, reservedBytes;
 
     public static class Part {
         public final VertexBuffer buffer;
@@ -67,6 +76,8 @@ public class StaticMeshCache {
         public final boolean instanceLight;
         public final GLCapabilities context;
         public final MeshIntegerAttributes.PartState attributes = new MeshIntegerAttributes.PartState();
+        public ResourceLocation owner;
+        public long residentBytes;
 
         public Part(VertexBuffer buffer, VertexFormat requestedFormat, RenderType material,
              CompletableFuture<Void> upload, boolean instanceLight) {
@@ -89,23 +100,56 @@ public class StaticMeshCache {
         public long retryAtNanos;
         public int failures;
         public boolean unsupported;
+        public long capturedGeneration;
+        public boolean reserved;
 
         public Entry(CacheKey key) { this.key = key; }
 
         public boolean ready() {
-            return parts != null && !parts.isEmpty()
-                    && parts.stream().allMatch(part -> part.upload.isDone() && !part.upload.isCompletedExceptionally());
+            if (parts == null || parts.isEmpty()) return false;
+            for (Part part : parts) if (!part.upload.isDone() || part.upload.isCompletedExceptionally()) return false;
+            return true;
         }
 
         public boolean failed() {
-            return parts != null && parts.stream().anyMatch(part -> part.upload.isCompletedExceptionally());
+            if (parts != null) for (Part part : parts) if (part.upload.isCompletedExceptionally()) return true;
+            return false;
         }
+
+        public boolean preparing() { return !unsupported && (parts == null || !ready() && !failed()); }
+    }
+
+    public record PreparationStats(long frame, int entries, int ready, int pendingParts,
+                                   long pendingBytes, long residentBytes, long reservedBytes,
+                                   int captures, long capturedBytes, long captureNanos,
+                                   int uploads, long uploadedBytes, long uploadNanos, long capturesTotal) {}
+
+    public static PreparationStats preparationStats() {
+        RenderSystem.assertOnRenderThread();
+        return new PreparationStats(frame, CACHE.size(), (int) CACHE.values().stream().filter(Entry::ready).count(),
+                UPLOADS.pendingParts(), UPLOADS.pendingBytes(), residentBytes, reservedBytes,
+                capturesInFrame, capturedBytesInFrame, captureNanosInFrame,
+                UPLOADS.uploadedParts(), UPLOADS.uploadedBytes(), UPLOADS.uploadNanos(), capturesTotal);
+    }
+
+    public static boolean isOwnerEnabled(ResourceLocation owner) { return FAILURES.enabled(owner); }
+    public static long currentFrame() { return frame; }
+
+    /** 首次异常记录完整调用栈并取消该 owner；清理失败时传播异常，禁止带着损坏状态继续渲染。 */
+    public static void disableOwner(ResourceLocation owner, String stage, RuntimeException failure) {
+        if (!FAILURES.disable(owner)) return;
+        boolean cleaned = true;
+        try { invalidateOwner(owner); }
+        catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); cleaned = false; }
+        SimpleBedrockModel.LOGGER.error("Static mesh owner {} disabled after failure in {}. "
+                + "Reload resources or change worlds to reset this path.", owner, stage, failure);
+        if (!cleaned) throw failure;
     }
 
     /**
      * 渲染线程上的轻量能力预检，供需要接管待准备网格的接入方使用。
      * 返回 false 表示缺少 GL 能力，或光照／覆盖坐标超出参数表范围，应使用旧渲染路径。
-     * 此处不捕获几何，也不分配或上传参数表；分配失败仍可重试。
+     * 此处不捕获几何，也不分配或上传参数表；故障后端由条件分支拒绝。
      */
     public static boolean supportsInstanceAttributes(int packedLight, int packedOverlay) {
         RenderSystem.assertOnRenderThread();
@@ -128,17 +172,18 @@ public class StaticMeshCache {
     }
 
     public static void pin(Entry entry) {
-        IDLE.remove(entry.key);
+        RESIDENCY.request(entry.key, entry);
         entry.references++;
     }
 
     public static void releaseEntry(Entry entry, Duration idleRetention) {
-        if (--entry.references == 0 && CACHE.get(entry.key) == entry) {
-            IDLE.retain(entry.key, entry, entry.bytes, idleRetention);
-        }
+        if (entry.references <= 0) throw new IllegalStateException("Mesh reference already released");
+        entry.references--;
+        RESIDENCY.retention(entry.key, entry, idleRetention);
     }
 
     public static void discard(Entry entry) {
+        RESIDENCY.forget(entry.key, entry);
         CACHE.remove(entry.key, entry);
         retire(entry, true);
     }
@@ -169,11 +214,11 @@ public class StaticMeshCache {
             if (format != null && probedFormat != null && probedFormat != format) clear();
             if (format != null) probedFormat = format;
         }
-        IDLE.evictExpired();
         return true;
     }
 
     public static Preparation prepareTarget(Entry entry, MeshGeometryProvider provider) {
+        if (!isOwnerEnabled(entry.key.owner())) return Preparation.UNSUPPORTED;
         if (entry.unsupported) return Preparation.UNSUPPORTED;
         if (entry.failed()) {
             retire(entry, true);
@@ -182,12 +227,14 @@ public class StaticMeshCache {
         }
         if (entry.parts == null) {
             long now = System.nanoTime();
-            if (now < entry.retryAtNanos || !captureBudgetAvailable(now)) return Preparation.PENDING;
+            if (now < entry.retryAtNanos || !captureBudgetAvailable(now)
+                    || UPLOADS.pendingBytes() >= POLICY.pendingBytes()) return Preparation.PENDING;
             long start = System.nanoTime();
             boolean captured = capture(entry, entry.key, provider);
-            capturesInWindow++;
-            captureNanosInWindow += System.nanoTime() - start;
+            capturesInFrame++;
+            captureNanosInFrame += System.nanoTime() - start;
             if (!captured) {
+                if (!isOwnerEnabled(entry.key.owner())) return Preparation.UNSUPPORTED;
                 if (entry.unsupported) return Preparation.UNSUPPORTED;
                 entry.retryAtNanos = System.nanoTime() + retryDelay(entry.failures++);
                 return Preparation.PENDING;
@@ -201,13 +248,8 @@ public class StaticMeshCache {
     }
 
     public static boolean captureBudgetAvailable(long now) {
-        long window = now / 16_000_000L;
-        if (captureWindow != window) {
-            captureWindow = window;
-            capturesInWindow = 0;
-            captureNanosInWindow = 0;
-        }
-        return capturesInWindow == 0 || capturesInWindow < 4 && captureNanosInWindow < 2_000_000L;
+        return capturesInFrame == 0 || capturesInFrame < POLICY.maxCaptures()
+                && captureNanosInFrame < POLICY.captureNanos();
     }
 
     public static long retryDelay(int failures) {
@@ -215,10 +257,12 @@ public class StaticMeshCache {
     }
 
     public static boolean capture(Entry entry, Object key, MeshGeometryProvider provider) {
-        ChunkRenderDispatcher dispatcher = Minecraft.getInstance().levelRenderer.getChunkRenderDispatcher();
-        if (dispatcher == null) return false;
+        if (!isOwnerEnabled(entry.key.owner())) return false;
+        if (entry.parts != null) return true;
+        long capturedGeneration = generation;
         GeometryCollector collector = new GeometryCollector();
         List<Part> parts = new ArrayList<>();
+        List<PendingUpload> uploads = new ArrayList<>();
         try {
             if (!provider.capture(collector)) return false;
             Map<GeometryCollector.Pass, MeshSink> meshes = collector.snapshot();
@@ -236,27 +280,131 @@ public class StaticMeshCache {
                     else fixed = true;
                 }
                 if (dynamic && fixed) {
-                    parts.forEach(part -> release(part, generation, true));
+                    uploads.forEach(PendingUpload::cancel);
+                    parts.forEach(part -> release(part, capturedGeneration, true));
                     SimpleBedrockModel.LOGGER.warn("Immediate mesh has mixed per-vertex lighting: {}", key);
                     entry.unsupported = true;
                     return false;
                 }
                 BufferBuilder.RenderedBuffer rendered = mesh.buildBuffer();
                 if (rendered == null) continue;
-                VertexBuffer buffer = POOL.acquire(mesh.format());
-                parts.add(new Part(buffer, mesh.format(), pass.getKey().material(),
-                        dispatcher.uploadChunkLayer(rendered, buffer), dynamic));
-                bytes += mesh.estimatedBytes();
+                // 当前调用内编码，以保存兼容钩子的分类数据；跨帧队列只持有独立上传数据。
+                VertexFormat format = rendered.drawState().format();
+                Part part;
+                try {
+                    part = new Part(POOL.acquire(format), format, pass.getKey().material(),
+                            new CompletableFuture<>(), dynamic);
+                } catch (RuntimeException failure) {
+                    rendered.release();
+                    throw failure;
+                }
+                part.owner = entry.key.owner();
+                parts.add(part);
+                PendingUpload upload;
+                try { upload = new PendingUpload(entry, part, rendered, capturedGeneration); }
+                catch (RuntimeException failure) { rendered.release(); throw failure; }
+                uploads.add(upload);
+                bytes += upload.bytes();
             }
             if (parts.isEmpty()) return false;
+            if (capturedGeneration != generation || CACHE.get(entry.key) != entry) {
+                uploads.forEach(PendingUpload::cancel);
+                parts.forEach(part -> release(part, capturedGeneration, true));
+                return false;
+            }
             entry.parts = parts;
             entry.bytes = bytes;
+            entry.capturedGeneration = capturedGeneration;
             entry.failures = 0;
+            if (!UPLOADS.enqueue(entry, uploads, () -> CACHE.get(entry.key) == entry
+                    && entry.capturedGeneration == generation, failure -> {
+                disableOwner(entry.key.owner(), "upload " + entry.key.geometry(), failure);
+                if (failure.getSuppressed().length != 0) throw failure;
+            })) throw new IllegalStateException("Mesh preparation already queued");
+            capturedBytesInFrame += bytes;
+            capturesTotal++;
             return true;
         } catch (RuntimeException exception) {
-            parts.forEach(part -> release(part, generation, true));
-            SimpleBedrockModel.LOGGER.warn("Failed to capture immediate static mesh {}", key, exception);
+            uploads.forEach(PendingUpload::cancel);
+            parts.forEach(part -> part.upload.cancel(false));
+            parts.forEach(part -> release(part, capturedGeneration, true));
+            entry.parts = null;
+            entry.bytes = 0;
+            disableOwner(entry.key.owner(), "capture " + key, exception);
             return false;
+        }
+    }
+
+    private static boolean admit(Entry entry) {
+        if (entry.reserved) return true;
+        while (reservedBytes > 0 && entry.bytes > POLICY.residentBytes() - reservedBytes) {
+            if (!RESIDENCY.reclaimIdle()) return false;
+        }
+        // 至少允许一个完整几何单独驻留，避免大模型上传部分 Part 后永久等待。
+        reservedBytes += entry.bytes;
+        entry.reserved = true;
+        return true;
+    }
+
+    private static class PendingUpload implements MeshUploadQueue.Upload {
+        private final Entry entry;
+        private final Part part;
+        private final long generation;
+        private final long bytes;
+        private BufferBuilder.RenderedBuffer data;
+
+        PendingUpload(Entry entry, Part part, BufferBuilder.RenderedBuffer data, long generation) {
+            this.entry = entry;
+            this.part = part;
+            this.data = data;
+            this.generation = generation;
+            this.bytes = (long) data.vertexBuffer().remaining() + data.indexBuffer().remaining();
+        }
+
+        @Override public long bytes() { return bytes; }
+        @Override public boolean admitted() { return admit(entry); }
+
+        @Override public void upload() {
+            BufferBuilder.RenderedBuffer payload = data;
+            data = null;
+            int previousVao = GL11.glGetInteger(GL30.GL_VERTEX_ARRAY_BINDING);
+            int previousArray = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
+            boolean consumed = false;
+            try {
+                if (part.buffer.isInvalid()) throw new IllegalStateException("Upload target retired");
+                part.buffer.bind();
+                consumed = true;
+                part.buffer.upload(payload); // VertexBuffer 负责在 finally 中释放 RenderedBuffer。
+                int error = GL11.glGetError(); // 只在低频上传点检查，不放入逐实例 draw。
+                if (error != GL11.GL_NO_ERROR) throw new IllegalStateException("OpenGL upload error 0x"
+                        + Integer.toHexString(error) + " for " + entry.key);
+                RenderSystem.glBindVertexArray(() -> previousVao);
+                GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, previousArray);
+                if (generation != StaticMeshCache.generation || CACHE.get(entry.key) != entry) {
+                    part.upload.cancel(false);
+                } else {
+                    part.residentBytes = bytes;
+                    residentBytes += bytes;
+                    part.upload.complete(null);
+                }
+            } catch (RuntimeException failure) {
+                part.upload.completeExceptionally(failure);
+                if (!consumed) payload.release();
+                restoreUploadBindings(previousVao, previousArray, failure);
+                throw failure;
+            }
+        }
+
+        private static void restoreUploadBindings(int vao, int array, RuntimeException failure) {
+            try { RenderSystem.glBindVertexArray(() -> vao); }
+            catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+            try { GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, array); }
+            catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+        }
+
+        @Override public void cancel() {
+            if (data != null) { data.release(); data = null; }
+            part.upload.cancel(false);
         }
     }
 
@@ -268,6 +416,8 @@ public class StaticMeshCache {
     }
 
     public static void retire(Entry entry, boolean invalidated) {
+        UPLOADS.cancel(entry);
+        if (entry.reserved) { reservedBytes -= entry.bytes; entry.reserved = false; }
         if (entry.parts == null) return;
         long retiringGeneration = generation;
         for (Part part : entry.parts) release(part, retiringGeneration, invalidated);
@@ -276,24 +426,49 @@ public class StaticMeshCache {
     }
 
     public static void release(Part part, long retiringGeneration, boolean invalidated) {
-        part.upload.whenComplete((ignored, failure) -> {
-            Runnable action = () -> {
-                if (part.context != GL.getCapabilities()) return;
-                if (invalidated || failure != null || retiringGeneration != generation) part.buffer.close();
-                else POOL.recycle(part.requestedFormat, part.buffer);
-            };
-            if (RenderSystem.isOnRenderThread()) {
-                action.run();
-            } else {
-                RenderSystem.recordRenderCall(action::run);
-            }
-        });
+        if (part.upload.isDone()) {
+            releaseUploaded(part, retiringGeneration, invalidated || part.upload.isCompletedExceptionally());
+            return;
+        }
+        // 不让 CompletableFuture 吞掉清理异常；真正的清理在明确的渲染线程入口执行。
+        part.upload.whenComplete((ignored, failure) -> RenderSystem.recordRenderCall(
+                () -> releaseUploaded(part, retiringGeneration, invalidated || failure != null)));
     }
 
-    @SubscribeEvent
+    private static void releaseUploaded(Part part, long retiringGeneration, boolean invalidated) {
+        residentBytes -= part.residentBytes;
+        part.residentBytes = 0;
+        if (part.context != GL.getCapabilities()) return;
+        try {
+            if (invalidated || retiringGeneration != generation) part.buffer.close();
+            else POOL.recycle(part.requestedFormat, part.buffer);
+        } catch (RuntimeException failure) {
+            if (part.owner != null) disableOwner(part.owner, "GPU release", failure);
+            else SimpleBedrockModel.LOGGER.error("Static mesh GPU release failed", failure);
+            throw failure;
+        }
+    }
+
+    @SubscribeEvent(priority = EventPriority.HIGHEST)
     @org.jetbrains.annotations.ApiStatus.Internal
-    public static void onClientTick(TickEvent.ClientTickEvent event) {
-        if (event.phase == TickEvent.Phase.END) IDLE.evictExpired();
+    public static void onRenderTick(TickEvent.RenderTickEvent event) {
+        if (event.phase != TickEvent.Phase.START) return;
+        beginFrame();
+    }
+
+    /** 帧开始上传上一帧保存的数据；实例命令仍由本帧调用重新提交。 */
+    public static void beginFrame() {
+        RenderSystem.assertOnRenderThread();
+        frame++;
+        capturesInFrame = 0;
+        captureNanosInFrame = capturedBytesInFrame = 0;
+        UPLOADS.beginFrame(frame);
+        ClientLevel current = Minecraft.getInstance().level;
+        if (current != level) { clear(); level = current; }
+        if (current == null) return;
+        supportsInstanceAttributes(0, 0);
+        RESIDENCY.beginFrame(frame);
+        UPLOADS.drain();
     }
 
     @SubscribeEvent
@@ -319,7 +494,6 @@ public class StaticMeshCache {
         Objects.requireNonNull(owner, "owner");
         List<Entry> retiring = CACHE.values().stream().filter(entry -> entry.key.owner().equals(owner)).toList();
         for (Entry entry : retiring) {
-            IDLE.remove(entry.key);
             discard(entry);
         }
     }
@@ -329,8 +503,10 @@ public class StaticMeshCache {
         RenderSystem.assertOnRenderThread();
         if (geometryContext != null && geometryContext != GL.getCapabilities()) POOL = new VertexBufferPool();
         generation++;
-        IDLE.clear();
-        for (Entry entry : CACHE.values()) {
+        FAILURES.reset();
+        RESIDENCY.clear();
+        UPLOADS.clear();
+        for (Entry entry : List.copyOf(CACHE.values())) {
             retire(entry, true);
         }
         CACHE.clear();

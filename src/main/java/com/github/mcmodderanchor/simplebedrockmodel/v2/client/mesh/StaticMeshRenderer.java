@@ -9,7 +9,6 @@ import com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh.render.MeshDr
 import com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh.debug.MeshRenderDebug;
 import static com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh.cache.StaticMeshCache.*;
 
-import com.github.mcmodderanchor.simplebedrockmodel.SimpleBedrockModel;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.PoseStack;
@@ -51,6 +50,9 @@ public class StaticMeshRenderer {
     }
 
     public static void invalidateOwner(ResourceLocation owner) { StaticMeshCache.invalidateOwner(owner); }
+    public static boolean isOwnerEnabled(ResourceLocation owner) { return StaticMeshCache.isOwnerEnabled(owner); }
+
+    public static StaticMeshCache.PreparationStats preparationStats() { return StaticMeshCache.preparationStats(); }
 
     public static MeshDrawResult tryDraw(ResourceLocation owner, Object key, MeshGeometryProvider provider,
                                          PoseStack pose, int light, int overlay) {
@@ -63,25 +65,33 @@ public class StaticMeshRenderer {
                                          Duration retention) {
         RenderSystem.assertOnRenderThread();
         Objects.requireNonNull(owner, "owner");
+        if (!isOwnerEnabled(owner)) return MeshDrawResult.UNSUPPORTED;
         if (!prepareRequest(key, provider, pose, light, overlay, retention)) return MeshDrawResult.UNSUPPORTED;
         Entry target = acquire(new CacheKey(owner, key));
         Entry previous = previousKey == null || previousKey.equals(key) ? null : CACHE.get(new CacheKey(owner, previousKey));
         if (previous != null) pin(previous);
+        MeshDrawResult result;
         try {
             Preparation prepared = prepareTarget(target, provider);
             if (prepared == Preparation.READY) {
                 // 开始绘制后不能尝试其他网格，因为可能已经提交了部分绘制。
-                return draw(target, pose, light, overlay) ? MeshDrawResult.DRAWN : MeshDrawResult.PENDING;
-            }
-            if (previous != null && previous.ready() && layoutSupported(previous)
+                result = draw(target, pose, light, overlay) ? MeshDrawResult.DRAWN : MeshDrawResult.PENDING;
+            } else if (previous != null && previous.ready() && layoutSupported(previous)
                     && (MeshRenderDebug.attributes != null || INTEGER_ATTRIBUTES.ensureReady())) {
-                return draw(previous, pose, light, overlay) ? MeshDrawResult.DRAWN_PREVIOUS : MeshDrawResult.PENDING;
+                result = draw(previous, pose, light, overlay) ? MeshDrawResult.DRAWN_PREVIOUS : MeshDrawResult.PENDING;
+            } else {
+                result = prepared == Preparation.UNSUPPORTED ? MeshDrawResult.UNSUPPORTED : MeshDrawResult.PENDING;
             }
-            return prepared == Preparation.UNSUPPORTED ? MeshDrawResult.UNSUPPORTED : MeshDrawResult.PENDING;
-        } finally {
+        } catch (RuntimeException failure) {
             releaseEntry(target, retention);
             if (previous != null) releaseEntry(previous, retention);
+            disableOwner(owner, "immediate request " + key, failure);
+            if (MeshRenderDebug.attributes != null || failure.getSuppressed().length != 0) throw failure;
+            return MeshDrawResult.PENDING;
         }
+        releaseEntry(target, retention);
+        if (previous != null) releaseEntry(previous, retention);
+        return result;
     }
 
     public static int attributeIndex(VertexFormat format, com.mojang.blaze3d.vertex.VertexFormatElement element) {
@@ -92,26 +102,26 @@ public class StaticMeshRenderer {
 
     public static boolean draw(Entry entry, PoseStack pose, int packedLight, int packedOverlay) {
         MeshRenderDebug.DrawAttributes attributes = MeshRenderDebug.attributes;
+        int previous = -1;
+        boolean debugStarted = false;
         try {
             if (attributes != null) {
                 attributes.beginItem();
-                try {
-                    return drawParts(entry, pose, packedLight, packedOverlay, attributes);
-                } finally {
-                    attributes.endItem();
-                }
+                debugStarted = true;
+            } else {
+                previous = INTEGER_ATTRIBUTES.beginItem();
             }
-            int previous = INTEGER_ATTRIBUTES.beginItem();
-            try {
-                return drawParts(entry, pose, packedLight, packedOverlay, null);
-            } finally {
-                INTEGER_ATTRIBUTES.endItem(previous);
-            }
+            boolean drawn = drawParts(entry, pose, packedLight, packedOverlay, attributes);
+            if (debugStarted) attributes.endItem();
+            else INTEGER_ATTRIBUTES.endItem(previous);
+            return drawn;
         } catch (RuntimeException exception) {
-            if (attributes != null) throw exception;
-            // 清理已完成，后续调用可重试；本次失败调用不能再绘制其他网格。
-            SimpleBedrockModel.LOGGER.warn("Failed to draw immediate static mesh {}", entry.key, exception);
-            failEntry(entry);
+            try {
+                if (debugStarted) attributes.endItem();
+                else if (previous >= 0) INTEGER_ATTRIBUTES.endItem(previous);
+            } catch (RuntimeException cleanup) { exception.addSuppressed(cleanup); }
+            disableOwner(entry.key.owner(), "immediate draw " + entry.key.geometry(), exception);
+            if (attributes != null || exception.getSuppressed().length != 0) throw exception;
             return false;
         }
     }
@@ -121,7 +131,8 @@ public class StaticMeshRenderer {
         MeshDrawTransform transform = new MeshDrawTransform(RenderSystem.getModelViewMatrix(), pose.last().pose());
         long lightOffset = MeshIntegerAttributes.parameterOffset(packedLight);
         long overlayOffset = MeshIntegerAttributes.parameterOffset(packedOverlay);
-        try (MeshBatchRenderer batch = new MeshBatchRenderer(RenderSystem.getProjectionMatrix())) {
+        MeshBatchRenderer batch = new MeshBatchRenderer(RenderSystem.getProjectionMatrix());
+        try {
             for (Part part : entry.parts) {
                 if (!batch.beginMaterial(part.material, transform.modelView)) {
                     throw new IllegalStateException("No active shader for " + part.material);
@@ -139,6 +150,10 @@ public class StaticMeshRenderer {
                 batch.drawItem(transform);
                 batch.finishMaterial();
             }
+            batch.close();
+        } catch (RuntimeException failure) {
+            batch.abort(failure);
+            throw failure;
         }
         return true;
     }

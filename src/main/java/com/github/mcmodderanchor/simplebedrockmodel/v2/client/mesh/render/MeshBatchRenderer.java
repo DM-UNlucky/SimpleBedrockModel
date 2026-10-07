@@ -86,15 +86,31 @@ public class MeshBatchRenderer implements AutoCloseable {
     public void finishMaterial() {
         RenderType previous = material;
         ShaderInstance previousShader = shader;
+        if (previous == null) return;
+        if (previousShader != null) previousShader.clear();
+        VertexBuffer.unbind();
+        previous.clearRenderState();
         material = null;
         shader = null;
         bound = null;
-        if (previous == null) return;
-        try {
-            if (previousShader != null) previousShader.clear();
-        } finally {
-            try { VertexBuffer.unbind(); }
-            finally { previous.clearRenderState(); }
+    }
+
+    /** 仅首次异常收尾；保留清理错误到原异常，交给边界日志和路径禁用处理。 */
+    public void abort(RuntimeException failure) {
+        RenderType previous = material;
+        ShaderInstance previousShader = shader;
+        material = null;
+        shader = null;
+        bound = null;
+        if (previousShader != null) {
+            try { previousShader.clear(); }
+            catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+        }
+        try { VertexBuffer.unbind(); }
+        catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
+        if (previous != null) {
+            try { previous.clearRenderState(); }
+            catch (RuntimeException cleanup) { failure.addSuppressed(cleanup); }
         }
     }
 

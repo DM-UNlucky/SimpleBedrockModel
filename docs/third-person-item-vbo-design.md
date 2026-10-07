@@ -1,60 +1,58 @@
 # 第三人称与掉落物静态网格接入
 
-更新日期：2026-10-07。本文记录 TaCZ 原型的几何和调用方要求；SBM 现行 API 以 [静态网格 API](static-mesh-api.md) 为准。VBO 优化未正式发布，没有线上兼容约束，旧 `client.world` 和即时原型名称已直接移除。
+更新日期：2026-10-07。以现有即时 VBO 的画面表现为基线，迁移到所属阶段的批量提交。SBM 现行接口见 [静态网格 API](static-mesh-api.md)，TaCZ 阶段方案见 [静态物品提交设计](D:/Minecraft/Dev/MCModderAnchor/TimelessAndClassicsZeroF/docs/static-item-mesh-submission-design.md)。
 
-## 实际范围
+## 状态与职责
 
-第三人称右手、GROUND 与世界内 FIXED 使用静态外观，运行时运动、掉落旋转和父层变换只进入实例矩阵。第一人称、GUI、第三人称左手和屏幕预览保持其现有入口。
+SBM 已实现共享缓存、临时队列、共用绘制后端和整数属性。TaCZ 的 Java 调用方及实体／shadow hook 待迁移。库实现类可扩展，可公开的方法保持 public。
 
-TaCZ 当前 Java 原型仍依赖旧本机 SBM 坐标及旧 API。本轮仅整理 SBM 库、示例和文档；TaCZ 实体阶段、Oculus 主场景/shadow 队列接入见 [静态物品提交设计](D:/Minecraft/Dev/MCModderAnchor/TimelessAndClassicsZeroF/docs/static-item-mesh-submission-design.md)，尚未实施。不要把工作区版本字段当作正式发布记录。
+第三人称右手、GROUND 和世界内 FIXED 使用静态外观。物品入口负责外观与实际 LOD，阶段所有者管理队列边界，SBM 负责捕获、上传、共享及绘制。展示枪继续由 WorldMeshGroup 管理长期对象。
 
-## 外观与捕获
+## 调用流程
 
-`ExternalGunAppearance` 解析不可变外观键与 Snapshot：资源修订、display、实际 LOD、配件/变体/adapter、弹膛及弹匣状态。far 可能引用 near，实际绘制/效果选择以 Snapshot.useLod() 为准。
+1. 当前渲染阶段打开共享队列。
+2. 物品入口检查支持范围，解析 ExternalGunAppearance 的不可变快照。
+3. 根据资源修订、外观、实际 LOD、视角及固定变换查询缓存。缺失几何在当前调用内按预算捕获，再异步上传。
+4. 选择完整就绪的目标或兼容 previous，保存 modelView、方向光逆线性变换、light 和 overlay 后提交。
+5. GROUND 调用返回；第三人称右手按选中的 Snapshot 立即生成枪口坐标和激光顶点。
+6. 所属阶段结束前按实际材质和网格集中绘制枪体。
 
-`DisplayGunGeometry.capture` 完成完整外观捕获，普通与固定发光图元使用独立材质。第三人称和 GROUND 在捕获时应用固定定位节点及 display scale；ItemRenderer 入口的捕获包含 `(0.5,0.5,0.5)` 补偿，运行时不再补第二次。展示枪绕开 ItemRenderer，保留自己的 FIXED 变换。
+## 几何与实例参数
 
-geometryKey 必须包含视角和实际捕获上下文。世界位置、运动、pose、light 和 overlay 不进入共享键。静态的非均匀 display 缩放在捕获时按法线矩阵处理；额外运行时非均匀缩放仍需游戏内验证。
+`DisplayGunGeometry.capture` 在捕获时应用视角定位节点和 display scale。ItemRenderer 入口包含 `(0.5,0.5,0.5)` 捕获补偿；展示槽位使用自己的 FIXED 变换。
 
-provider 在 submit / tryDraw 内按预算同步调用，队列不保留 ItemStack、provider 或可变模型实例。相同外观/视角共享 VBO，不进行逐帧顶点烘焙，也不建立每实体 VBO。
+外观键包括模型、材质、实际 LOD、配件／变体／adapter、弹膛与弹匣状态。相同外观和视角共享 VBO。世界位置、运动、旋转、姿势、light 和 overlay 保存为实例参数。
 
-## 库入口与交接
+普通与固定发光几何使用各自材质。普通 UV2 和所有 UV1 读取整数参数表，divisor=1；固定发光 UV2 使用几何来源，divisor=0。实际上传格式和属性来源由 Part 校验。
 
-`v2.client.mesh.StaticMeshRenderer` 的即时绘制与 `StaticMeshBufferSource` 使用同一 owner 缓存和共用 `MeshBatchRenderer`。WorldMeshGroup 继续管理展示枪的长期对象、剔除和 SECTION 生命周期；不能把临时物品登记成世界组对象。
+## 结果与生命周期
 
-```java
-MeshDrawResult result = StaticMeshRenderer.tryDraw(
-        owner, geometryKey, previousKey, provider, pose, light, overlay, retention);
+| 结果 | 调用方行为 |
+| --- | --- |
+| 已提交／已绘制 | 使用实际选中 Snapshot.useLod()，对齐动态效果 |
+| PENDING | 本次调用由 VBO 接管，等待准备完成 |
+| UNSUPPORTED | 交给既有模型／AR 路径 |
 
-try (StaticMeshBufferSource batch = StaticMeshRenderer.openBatch(owner, order, pass::isCurrent)) {
-    MeshSubmitResult submitted = batch.submit(
-            geometryKey, previousKey, provider, pose, light, overlay, retention);
-    batch.endBatch();
-}
-```
+previous 使用兼容的已准备网格。矩阵在提交时复制，调用方随后可弹出 PoseStack。命令持有网格引用直到排空或取消。
 
-QUEUED 只表示已选择网格并入队。PENDING 接管此次物品调用，不遍历旧枪体；只有明确不支持时返回 UNSUPPORTED。previous 仅查询兼容且已经就绪的网格，返回结果让调用方按实际选中的 Snapshot 对齐枪口和激光。
+正常结束用 endBatch，提前排空用 flush，异常退出用 close。失效命令按所属代次退役；绘制失败时完成清理，本次保持 VBO 接管，后续调用重新准备。
 
-TaCZ 使用固定 owner `tacz:external_item_guns`；关闭开关仅调用 invalidateOwner，不清理其他接入方。资源重载、世界切换和 GL context/格式失效由库处理。正式接入新包时须使用包含新 API 的新版本坐标。
+TaCZ 使用 owner `tacz:external_item_guns`。关闭功能调用 invalidateOwner；资源重载、世界切换及格式／上下文变化由库生命周期处理。新 API 随新版本坐标发布，再同步 TaCZ 依赖。
 
-## 绘制边界与属性
+## 阶段与光影
 
-pass 所有者负责打开 scope、判断其身份并在统一边界 endBatch。flush 只提前排空本 scope，之后仍可提交；close 只取消。没有 beforeDraw / beforeFlush 空回调，没有全局帧末队列，也不从任意 MultiBufferSource 反射寻找 delegate。
+普通实体阶段覆盖掉落物、第三人称右手和 ItemFrame，在实体循环结束、原版集中提交前排空。BER 使用独立 scope。Oculus 主场景和 shadow 分别结束，shadow 在集中提交及深度复制前绘制。
 
-同一实例的完整矩阵在提交时复制；调用方可以立即 pop PoseStack。共享 shader 参数和目标在排空前须保持稳定。Oculus 的材质 wrapping、方向光/颜色快照与语义 IDs 接入仍需在真实 pass 阶段完成；烘入顶点的数据必须进 geometryKey，而非只在 flush 时恢复 IDs。
+现有捕获、材质和光照行为继续作为基线。同阶段固定的共享状态由 scope 维护，实际逐对象差异才加入提交保存或分组。
 
-普通 UV2 和所有 UV1 从 512 KiB GL_INT 参数表读取，divisor=1；固定发光 UV2 保留实际上传格式中的几何来源和 divisor=0。Part 缓存来源、代次及 offset。能力缺失或任一完整 16 位分量超出 0–255 时，在外观解析前明确回退。
+Oculus 启用扩展格式时会通过 BufferBuilder Mixin 自动写入当前分类字段，这一机制也作用于旧即时路径。先核对真实格式和捕获值，再按影响输出的实际差异处理缓存键或绘制状态。
 
-世界组保留 UNIFORM/FIXED/MUTABLE 属性策略。两类入口共用材质/shader/VAO draw 和清理，不统一其实际光照存储需求。
-
-未知 pass 的已验证即时 VBO 仍有用途。首版忽略枪体 outline，枪体正常进入所属 pass；不因 outline source 或光影开启而自动回退或永久 PENDING。
+尚未建立队列接入的已验证调用使用同缓存即时 VBO。首版 outline 行为为正常枪体绘制，实体其他几何沿用原版处理。
 
 ## 动态效果与验收
 
-枪口坐标和激光顶点在调用期、当前实体与实际 LOD 有效时生成。激光继续写原版 consumer，不在每次效果生成前拆开枪体队列；枪体按所属 pass 的集中边界提交。实际遮挡和透明次序以游戏内画面对照为准。
+枪口和激光在当前实体、姿势栈和实际 LOD 有效时生成。激光写入现有原版 consumer，枪体在所属阶段集中绘制。通过游戏内对照确认最终遮挡和提交次序。
 
-异常可能已经提交部分 Part；清理后取消余下命令，同次调用不能运行 previous 或旧枪体 fallback。零 retention 也不能提前释放待绘制条目；失效命令释放后不能重入新缓存。
+验收覆盖真实 ItemEntity／ItemFrame、堆叠副本、父矩阵、浮动／旋转、LOD／previous、配件激光、枪口、明暗／overlay、资源重载、开关、世界切换，以及默认／Fabulous／两个 Oculus 版本的主场景和 shadow。
 
-本轮不新增单元测试。结构验证使用编译、打包与源码引用检查；整数属性用隐藏 GL 像素检查。真正验收仍需真实 ItemEntity/ItemFrame、堆叠副本、父矩阵、实际 LOD/previous、配件激光、枪口、明暗/overlay、F3+T、开关、世界切换、默认/Fabulous 及两个 Oculus 版本的主场景/shadow。
-
-游戏内对照命令及历史结果见 [网格提交测量](immediate-mesh-batch-benchmark.md) 和 [整数属性测量](immediate-attribute-game-benchmark.md)。CPU 应统计 submit + flush；draw 数没有降低，主要收益来自材质 setup 和 VAO bind 合并。
+结构验证采用编译、打包与引用检查，整数属性采用隐藏 GL 像素检查。性能记录见 [合批测量](immediate-mesh-batch-benchmark.md) 和 [整数属性测量](immediate-attribute-game-benchmark.md)，CPU 统计包含 submit 与 flush。

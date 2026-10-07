@@ -366,7 +366,7 @@ public class WorldMeshRenderer {
         shard.localTransform = localTransform;
         shard.bounds = worldBounds;
         // FIXED / MUTABLE 使用网格自身的光照，忽略实例值；
-        // 全动态（UNIFORM）虽然不占缓冲，但它的常量属性值就是实例光照，所以必须按光照分组。
+        // UNIFORM 从整数参数表读取实例光照，按光照排序可减少同一 VAO 的参数偏移更新。
         shard.light = handle.lightMode() == WorldMeshPart.LightMode.FIXED
                 || handle.lightMode() == WorldMeshPart.LightMode.MUTABLE ? 0 : packedLight;
         collectedCount++;

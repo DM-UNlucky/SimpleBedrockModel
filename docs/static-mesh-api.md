@@ -1,26 +1,26 @@
 # 静态网格 API 与实现结构
 
-更新日期：2026-10-07。VBO 优化尚未正式发布，没有线上调用方。本轮直接替换原型 API 和包路径，不保留兼容适配器。
+更新日期：2026-10-07。VBO 优化处于发布前开发阶段，原型 API 和包路径直接迁移到现行结构。
 
-## 按职责组织
+## 职责与包结构
 
-包根为 `com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh`，具体实现按数据与执行职责拆分：
+包根为 `com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh`。
 
-| 包 | 直接职责与主要类型 |
+| 包 | 职责与主要类型 |
 | --- | --- |
-| `mesh` | 临时提交入口、scope 和结果：StaticMeshRenderer、StaticMeshBufferSource、MeshDrawResult、MeshSubmitResult、MeshFlushStats；资源监听 MeshLifecycle |
-| `mesh.capture` | CPU 几何捕获与图元分流：GeometryCollector、MeshGeometryProvider、MeshSink、LightPassVertexRouter |
-| `mesh.cache` | 临时共享缓存、捕获预算、引用和失效：StaticMeshCache、IdleMeshCache、MeshCachePolicy |
-| `mesh.gpu` | VBO 池、上传/回收、光照流、整数属性与格式：VertexBufferPool、WorldMeshBuffers、WorldMeshPart、MeshIntegerAttributes、LightRangeUpdates、MeshLighting、MeshVertexFormat |
-| `mesh.render` | 两类实例共用的材质/shader/VAO draw：MeshBatchRenderer、MeshDrawTransform、EmissiveMeshRenderTypes |
-| `mesh.world` | 长期对象、世界阶段、剔除、INSTANCE/SECTION、每组 CPU 几何缓存与统计 |
+| `mesh` | 临时提交、scope、结果与资源监听：StaticMeshRenderer、StaticMeshBufferSource、MeshDrawResult、MeshSubmitResult、MeshFlushStats、MeshLifecycle |
+| `mesh.capture` | CPU 捕获和图元分流：GeometryCollector、MeshGeometryProvider、MeshSink、LightPassVertexRouter |
+| `mesh.cache` | 共享缓存、驻留、帧准备预算和故障禁用：StaticMeshCache、MeshCacheResidency、MeshUploadQueue、MeshPreparationPolicy、MeshPathFailures、IdleMeshCache、MeshCachePolicy |
+| `mesh.gpu` | 缓冲池、上传／回收、光照流、整数属性和格式：VertexBufferPool、WorldMeshBuffers、WorldMeshPart、MeshIntegerAttributes、LightRangeUpdates、MeshLighting、MeshVertexFormat |
+| `mesh.render` | 共用材质／shader／VAO 执行：MeshBatchRenderer、MeshDrawTransform、EmissiveMeshRenderTypes |
+| `mesh.world` | 长期对象、世界阶段、剔除、INSTANCE／SECTION、每组几何缓存及统计 |
 | `mesh.debug` | 开发属性对照：MeshRenderDebug |
 
-这次拆分同时移动职责：StaticMeshRenderer 不再持有缓存表、捕获队列预算或上传释放状态；这些归 StaticMeshCache。WorldMeshRenderer 不再直接上传、回收 GPU 缓冲或维护光照流；这些归 WorldMeshBuffers。两种来源共用 MeshBatchRenderer 的材质/shader/VAO 执行和清理，不再各写一套 draw 循环。
+StaticMeshRenderer 执行即时绘制并创建临时队列；StaticMeshCache 持有临时几何生命周期。WorldMeshRenderer 管理世界阶段与登记组，WorldMeshBuffers 管理 GPU 生命周期。两类来源共用 MeshBatchRenderer 和 MeshSink.buildBuffer。
 
-不使用 `final class`，实现类和可公开的方法全部 `public`。不通过访问限制规定使用路线，也不增加公开接口的转发 facade。GeometryCollector 的构造、Pass、snapshot、MeshSink 和 GPU 句柄可直接使用；标准入口仍在捕获回调中提供 collector。MeshRenderDebug 只保留真实开发属性覆盖，不再转发几何统计或光照分流。
+实现类可扩展，可公开的方法均为 public。GeometryCollector 的构造、Pass、snapshot、MeshSink 和 GPU 句柄可直接使用。
 
-## 临时网格
+## 临时提交
 
 ```java
 ResourceLocation owner = new ResourceLocation("mymod", "static_items");
@@ -29,69 +29,70 @@ try (StaticMeshBufferSource batch = StaticMeshRenderer.openBatch(
         owner, StaticMeshRenderer.BatchOrder.MATERIAL, pass::isCurrent)) {
     MeshSubmitResult result = batch.submit(key, previousKey, provider,
             pose, light, overlay, Duration.ofSeconds(30));
-    // provider 在 submit 内按预算同步调用；返回后不会保存 provider 或业务对象。
-    // result.hasMesh() 后，可立即按 result.usedPrevious() 选择动态效果的模型。
+    // provider 在 submit 内按预算同步执行。
+    // result.hasMesh() 后，按 result.usedPrevious() 选择对应动态效果。
     batch.endBatch();
 }
 ```
 
-`SUBMISSION` 保留调用和 Part 顺序，只合并连续相同材质；`MATERIAL` 明确允许按实际 RenderType 和共享 Part 重排。同材质 setup/apply/clear 一次，同网格 bind 一次，实例仍单独 draw。透明排序仍由调用方负责。
+SUBMISSION 保持调用和 Part 顺序，合并连续相同材质；MATERIAL 按实际 RenderType 和共享 Part 分组。同材质 setup／apply／clear 一次，同网格连续绘制期间 bind 一次，每个实例单独 draw。顺序敏感材质由调用方安排提交次序。
 
 | 操作 | 契约 |
 | --- | --- |
-| `submit` | 准备目标，或选择已经完整就绪的兼容 previous；复制完整 modelView 和方向光逆线性变换，pin 选中条目 |
-| `flush` | 排空已有命令、释放引用，继续接受本 pass 后续提交；只返回本次增量统计 |
-| `endBatch` | 执行最后一次 flush 后关闭；不累加此前统计 |
-| `discard` / `close` | 幂等取消并关闭，不隐式绘制 |
+| submit | 准备目标或选择兼容的已就绪 previous，复制实例参数并持有选中网格 |
+| flush | 排空本次命令、释放引用，保持 scope 开启；返回本次增量统计 |
+| endBatch | 执行最后一次排空并关闭；返回最后一次排空统计 |
+| discard／close | 幂等取消待提交命令并关闭 |
 
-`QUEUED` / `QUEUED_PREVIOUS` 仅表示选择了完整网格并入队，不等于 DRAWN。`PENDING` 仍接管此次调用，不运行旧模型。只有 `UNSUPPORTED` 允许旧路径。
+QUEUED／QUEUED_PREVIOUS 表示网格已选中并入队；PENDING 表示本次调用由 VBO 接管并等待准备；UNSUPPORTED 交给调用方的其他绘制路径。
 
-世界、GL context、投影、资源/格式代次失效时，排空会取消旧命令。owner 失效时，仅剔除其旧条目对应的命令。零 retention 不会关闭仍被命令持有的网格；旧命令释放也不会把失效条目放回新缓存。
-
-绘制异常可能发生在部分 Part 已提交后。库清理 shader、VAO、材质和参数缓冲绑定，取消剩余引用，关闭 scope 并抛出异常；调用方不得在同一次 pass 运行 previous 或旧枪体 fallback。正常结束用 endBatch，异常 finally 用 close。
-
-即时入口仍有独立用途：未接入队列的已验证调用可以使用同一缓存直接绘制。
+即时入口使用同一缓存：
 
 ```java
 MeshDrawResult result = StaticMeshRenderer.tryDraw(
         owner, key, previousKey, provider, pose, light, overlay, retention);
 ```
 
-没有 beforeDraw / beforeFlush 空回调。需要协调原版缓冲时，pass 所有者直接在确定的边界调用原版提交与网格 flush；库不会解包 MultiBufferSource 或接管材质调度。
+阶段所有者从实际入口取得缓冲与目标，在确定的边界协调原版提交和网格排空。
 
-## 内部职责
+## 缓存与属性
 
-| 实现 | 职责 |
-| --- | --- |
-| `StaticMeshCache.Entry / Part` | 临时共享网格、引用、准备预算、重试、上传 future 与整数属性状态 |
-| `StaticMeshBufferSource.Command` | 短期命令；只持有选中网格和实例参数 |
-| `WorldMeshGroup`、`GeometryCache`、`InstanceMeshBatches`、`SectionMeshBatches` | 长期对象、捕获任务、共享缓存、剔除与策略换版 |
-| `WorldMeshBuffers / WorldMeshPart` | 世界网格 GPU 所有权、异步上传后的回收、可变光照流 |
-| `MeshBatchRenderer` | 两种来源共用的材质状态、共享 uniform、矩阵/方向光、VAO bind/draw 与异常清理 |
-| `MeshIntegerAttributes` | 临时网格 UV1/UV2 的整数参数表及每 Part 来源缓存 |
-| `MeshSink`、`LightPassVertexRouter`、`MeshVertexFormat` | CPU 捕获、光照分流与实际格式探测 |
-| `VertexBufferPool`、`IdleMeshCache` | 资源池与空闲淘汰 |
+临时缓存键为 `(owner, geometryKey)`。geometryKey 描述影响捕获结果的模型、材质、实际 LOD、视角变换等状态；位置、姿势、light 和 overlay 作为实例参数保存。
 
-世界绘制保留 UNIFORM/FIXED/MUTABLE 属性策略；临时物品保留整数参数表和动态 overlay。统一绘制后端不把这两套真实属性需求混成一套可配置公开策略，也不把物品登记成世界对象。
+临时网格在调用期同步捕获并编码；跨帧任务保存独立 RenderedBuffer、实际格式和各 Part 上传进度，全部上传完成后保存就绪 GPU Part 和整数属性状态。世界组保存 CPU 几何以供 SECTION 拼接。INSTANCE 的 Resident 直接持有 active／pending。WorldMeshPart 持有所属 WorldMeshBuffers，释放交还该所有者。
 
-缓存和捕获/上传的生命周期仍由各入口拥有：世界 CPU 几何还需要供 SECTION 拼接，临时缓存只需持有 Part。共用执行后端不强行合并这两类存储。INSTANCE 的 active/pending 直接由 Resident 持有，删除只服务单处的泛型 MeshSwap 回调包装。WorldMeshPart 直接持有所属 WorldMeshBuffers，释放不再回调全局 WorldMeshRenderer。
+相同键复用唯一准备任务。最近在当前帧或上一帧请求过的条目、正在准备的条目和持有绘制引用的条目保持驻留，不参加 128 条空闲 LRU 淘汰。停止请求后，准备任务在 retention 到期时取消；就绪几何进入闲置 LRU，TTL 从最后请求时间计算。释放一次调用的引用只结束该次使用，不取消准备任务。
 
-## owner 与生命周期
+Forge RenderTick START 推进上一帧的上传任务。默认每帧捕获最多 4 次／2ms，上传最多 4 个 Part／8MiB／2ms；时间为 CPU 软预算，首个 Part 可以越过字节／时间额度以保证进度。准备数据和整套几何驻留分别使用 256MiB 软准入预算，优先回收真正闲置的几何；允许一个超大几何单独驻留，避免部分 Part 上传后永久堵塞。预算不足时任务继续等待。`StaticMeshRenderer.preparationStats()` 返回准备、上传、驻留字节与累计捕获统计，调用方无需管理任务状态。
 
-临时缓存键为 `(ResourceLocation owner, geometryKey)`。`invalidateOwner(owner)` 只失效该接入方；资源重载、世界卸载、实际格式变化和 GL context 变化由库统一处理。关闭一个物品优化开关不再清空其他模组的临时缓存。
+世界光照采用 UNIFORM／FIXED／MUTABLE。UNIFORM 和临时网格都通过整数参数表及 divisor=1 提供实例 UV2，不使用 `glVertexAttribI2i` 常量属性；世界网格的 UV1 保持读取几何，临时网格的 overlay 从参数表读取。参数表支持每个分量 0–255，世界 UNIFORM 的能力／范围／上传检查失败时 `prepareDraw` 返回 false。FIXED／MUTABLE 的 UV2 按实际上传格式读取几何或可变流，divisor=0，缓冲池复用时重新挂载。两者共用材质绘制、矩阵／方向光处理及 GPU 状态清理。
 
-geometryKey 必须包含影响捕获结果的所有状态，包括实际 LOD、材质、视角变换及光影烘入顶点的语义 IDs。位置、每帧 pose、light 和 overlay 不进入 key。需要光影 geometrySalt 时，接入方把不可变 salt 组合进自己的 key；兼容 previous 也必须带相同捕获上下文。
+## 生命周期
 
-所有操作在渲染线程执行。调用方可在 submit 后立即 pop PoseStack。队列只保存矩阵及整数参数，当前共享 shader 状态仍需在排空前保持稳定；传入的 isCurrent 应校验所属 pass、目标和 pipeline 身份。同投影不代表同 pass。
+所有操作在渲染线程执行。provider 在当前调用内按预算同步捕获和编码，不跨帧保存临时 ItemStack、PoseStack 或 consumer。GPU 上传由 SBM 自己的跨帧队列在帧开始执行 VertexBuffer.upload，并在执行点计入预算；不再将临时网格一次性推入 ChunkRenderDispatcher。全部 Part 就绪后才能提交绘制；绘制命令保存独立矩阵、整数参数和网格引用，仅属于创建它的当前帧／阶段。
 
-## 本轮明确保留的边界
+命令持续持有网格直到排空或取消，释放引用不改变跨帧准备任务的有效性。世界、GL context、资源／格式代次或 owner 失效时，取消对应准备任务并精确释放未上传数据及 GPU Part；失效的绘制命令不会跨帧补画。
 
-本轮完成库结构和 API 清理，没有新增 TaCZ 实体/shadow hook、Oculus context 快照或 outline 双路绘制。`MeshPassBinding`、`MeshRenderContext`、通用 native 材质 bridge 仍是设计候选，不作为本轮公开接口。
+生产热路径以条件预检、显式正常收尾和明确的异常边界处理错误，不使用静默的 try-finally 继续执行。首次捕获、上传或绘制 RuntimeException 记录 owner、阶段与完整调用栈，并取消和禁用该 owner；后续请求直接返回 UNSUPPORTED，资源／格式重置或世界切换后才恢复。参数表分配故障同样停用该后端。若清理本身失败，追加到原异常并向上传播，禁止继续在损坏状态下渲染。已经可能部分绘制的本次调用仍由 VBO 接管，避免重复绘制。
 
-TaCZ 下一步应直接迁移新包与新结果类型，使用固定 owner，并在真实 pass 接入时补齐共享光照/颜色快照、实际材质 wrapping 和烘入顶点的语义 IDs。激光和枪口仍在调用期生成，枪体在明确 pass 边界排空。未知 pass 的即时 VBO 不属于弃用路线。
+## TaCZ 接入依据
 
-版本号没有在本轮提升或发布；现有 `2.5.23-forge-mc1.20.1` 字段是工作区状态，不能据此推断远程依赖含有这些 API。正式发布使用新坐标，再同步 TaCZ 最低依赖范围。
+SBM 基础设施已实现。TaCZ 已迁移新包引用、固定 owner 和调用方结果，动态效果按实际选中 Snapshot 对齐；当前使用同一缓存的即时 VBO，真实实体／shadow 阶段的队列接入待实施。
 
-本轮不新增单元测试。验证采用 Java 编译、打包、源码引用检查及隐藏 GL 像素检查；原有矩阵/整数属性测试只迁移包名。游戏内世界组、材质合批性能和 TaCZ 主场景/shadow 仍需实机验收。
+以现有即时 VBO 的正常表现为基线。同阶段固定的 shader 状态由 scope 维护；实际逐对象差异才保存到提交项或加入绘制分组。isCurrent 由阶段所有者校验所属 scope、目标和管线代次。
 
-本轮已通过 `compileJava reobfJarJar sourcesJar --offline`。正式 jar 核对不含旧 `client.world`、平铺实现类、MeshSwap 或 example 资源。隐藏 OpenGL 3.3 属性检查通过，覆盖同一作用域连续 32 次 draw、交替 VAO、变化 light/overlay、固定发光、绑定被改写及参数表重建；这项检查不覆盖游戏 shader 和实际实体/shadow pass。
+Oculus 的 CapturedRenderingState 是其全局渲染状态记录。扩展格式启用时，普通 BufferBuilder 会通过 Mixin 自动附加当前分类字段，现有即时路径也经过这一机制。根据实际格式、捕获值及画面差异决定缓存区分和状态保存。
+
+## 发布与验证
+
+静态准备任务、驻留及帧上传预算的实现边界见 [准备生命周期设计](static-mesh-preparation-design.md)。
+
+新 API 随 `com.github.mcmodderanchor:simplebedrockmodel:2.5.26-forge-mc1.20.1` 发布，再同步 TaCZ 依赖范围。执行 `./gradlew publishToMavenLocal --offline` 可将重混淆后的完整 jar 和 sources jar 发布到 Maven Local。
+
+已通过 `compileJava reobfJarJar sourcesJar --offline` 和产物引用检查。隐藏 OpenGL 3.3 检查覆盖连续 32 次 draw、交替 VAO、变化 light／overlay、固定发光、绑定改写和参数表重建。原有矩阵／整数属性测试已迁移包名。
+
+`2.5.25` 已移除生产世界网格的常量整数属性路径。隐藏 GL 检查直接调用 WorldMeshBuffers.prepareDraw，覆盖 UNIFORM／FIXED／MUTABLE、几何 overlay、参数表重建、同格式 VAO 复用及 UV2 位于索引 4／3 两种实际格式。I2I／I4I 对照仅保留在不随发布 jar 打包的 example／tools 基准中。
+
+`2.5.26` 的 115 项测试全部通过。准备队列回归覆盖 512 实例／200 键、每键一次捕获、上传软预算、闲置回收、取消与故障隔离；隐藏 GL 检查以独立编码数据驱动真实缓存和 PendingUpload，验证 200 份 VBO 上传、持续驻留、读回、绑定恢复及 owner 清理。故障注入验证首次捕获异常日志、owner 禁用、后续不再执行失败 provider，以及显式生命周期重置。
+
+游戏内验收采用世界组、真实物品和主场景／shadow 对照；当前自动基准比较 immediate、ordered、batched 三条 VBO 路径。

@@ -20,7 +20,7 @@ import org.lwjgl.opengl.GLCapabilities;
 
 import java.nio.IntBuffer;
 
-/** 临时网格后端独占的整数属性数组；所有 GPU 操作均在渲染线程执行。 */
+/** 网格后端持有的整数参数表；临时网格读取 light／overlay，世界网格仅读取实例 light。 */
 @OnlyIn(Dist.CLIENT)
 public class MeshIntegerAttributes {
     static final int COORDINATES = 256;
@@ -33,9 +33,34 @@ public class MeshIntegerAttributes {
     private int maxAttributes;
     private int buffer = -1;
     private long generation;
-    private long retryAtNanos;
+    private boolean failed;
 
     public enum Backend { UNSUPPORTED, CORE, ARB }
+
+    /** 世界网格只替换 UV2；UV1 继续读取几何，状态随句柄和 VAO 的生命周期保存。 */
+    public static class LightState {
+        private VertexFormat format;
+        private int geometryBuffer = -1;
+        private int lightIndex = -1;
+        private int parameterBuffer = -1;
+        private long parameterGeneration = -1;
+        private long lightOffset = -1;
+        private boolean attached;
+
+        public void invalidate() { attached = false; }
+
+        public boolean prepareLayout(VertexBuffer geometry, int maxAttributes) {
+            VertexFormat uploaded = geometry.getFormat();
+            if (uploaded == null || geometry.isInvalid() || geometry.vertexBufferId < 0) return false;
+            if (format != uploaded || geometryBuffer != geometry.vertexBufferId) {
+                invalidate();
+                format = uploaded;
+                geometryBuffer = geometry.vertexBufferId;
+                lightIndex = uploaded.getElements().indexOf(DefaultVertexFormat.ELEMENT_UV2);
+            }
+            return lightIndex >= 0 && lightIndex < maxAttributes;
+        }
+    }
 
     public static Backend selectBackend(boolean gl30, long integerPointer, boolean gl33, long corePointer,
                                  boolean arbInstancing, long arbPointer) {
@@ -96,13 +121,13 @@ public class MeshIntegerAttributes {
             supported = backend != Backend.UNSUPPORTED;
             maxAttributes = supported ? GL11.glGetInteger(GL20.GL_MAX_VERTEX_ATTRIBS) : 0;
             if (!supported) {
-                SimpleBedrockModel.LOGGER.warn("Immediate buffered integer attributes unavailable: "
+                SimpleBedrockModel.LOGGER.warn("Buffered mesh integer attributes unavailable: "
                                 + "OpenGL30={}, IPointer={}, core divisor={}, ARB extension={}, ARB divisor={}",
                         current.OpenGL30, current.glVertexAttribIPointer != 0,
                         coreDivisor, current.GL_ARB_instanced_arrays, current.glVertexAttribDivisorARB != 0);
             }
         }
-        return supported && parameterOffset(packedLight) >= 0 && parameterOffset(packedOverlay) >= 0;
+        return supported && !failed && parameterOffset(packedLight) >= 0 && parameterOffset(packedOverlay) >= 0;
     }
 
     /** 检查两个完整的无符号 16 位分量，不截断，也不钳制数值。 */
@@ -122,10 +147,14 @@ public class MeshIntegerAttributes {
         return state.prepareLayout(geometry, maxAttributes);
     }
 
-    /** 分配或上传失败可重试，并在任何 Part 开始绘制前检测。 */
+    public boolean layoutSupported(LightState state, VertexBuffer geometry) {
+        return state.prepareLayout(geometry, maxAttributes);
+    }
+
+    /** 分配／上传失败记录并停用后端，直到明确的生命周期重置。 */
     public boolean ensureReady() {
         if (buffer >= 0) return true;
-        if (!supported || System.nanoTime() < retryAtNanos) return false;
+        if (!supported || failed) return false;
         int previous = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
         int created = -1;
         try {
@@ -142,11 +171,10 @@ public class MeshIntegerAttributes {
             buffer = created;
             created = -1;
             generation++;
-            retryAtNanos = 0;
             return true;
         } catch (RuntimeException exception) {
-            retryAtNanos = System.nanoTime() + 1_000_000_000L;
-            SimpleBedrockModel.LOGGER.warn("Failed to prepare immediate integer attributes; retrying later", exception);
+            failed = true;
+            SimpleBedrockModel.LOGGER.error("Mesh integer attributes disabled after parameter buffer failure", exception);
             return false;
         } finally {
             GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, previous);
@@ -156,17 +184,32 @@ public class MeshIntegerAttributes {
 
     public int beginItem() {
         int previous = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
-        try {
-            GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, buffer);
-        } catch (RuntimeException exception) {
-            endItem(previous);
-            throw exception;
-        }
+        GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, buffer);
         return previous;
     }
 
     public void endItem(int previous) {
         GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, previous);
+    }
+
+    /** 在已绑定的世界网格 VAO 上设置实例 UV2，保持几何 overlay 和调用方 ARRAY_BUFFER 绑定。 */
+    public void setupLight(LightState state, long lightOffset) {
+        if (!state.attached || state.parameterBuffer != buffer || state.parameterGeneration != generation) {
+            state.invalidate();
+            state.lightOffset = -1;
+            GlStateManager._enableVertexAttribArray(state.lightIndex);
+            divisor(state.lightIndex, 1);
+        }
+        if (state.lightOffset != lightOffset) {
+            int previous = GL11.glGetInteger(GL15.GL_ARRAY_BUFFER_BINDING);
+            if (previous != buffer) GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, buffer);
+            GlStateManager._vertexAttribIPointer(state.lightIndex, 2, GL11.GL_INT, STRIDE, lightOffset);
+            state.lightOffset = lightOffset;
+            if (previous != buffer) GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, previous);
+        }
+        state.parameterBuffer = buffer;
+        state.parameterGeneration = generation;
+        state.attached = true;
     }
 
     public void setupPart(PartState state, boolean instanceLight, long lightOffset, long overlayOffset) {
@@ -215,6 +258,6 @@ public class MeshIntegerAttributes {
         if (buffer >= 0 && context == GL.getCapabilities()) RenderSystem.glDeleteBuffers(buffer);
         buffer = -1;
         generation++;
-        retryAtNanos = 0;
+        failed = false;
     }
 }
