@@ -2,11 +2,11 @@ package example.client.worldmesh;
 
 import com.github.mcmodderanchor.simplebedrockmodel.SimpleBedrockModel;
 import com.github.mcmodderanchor.simplebedrockmodel.v1.client.renderer.BedrockModelRenderTypes;
-import com.github.mcmodderanchor.simplebedrockmodel.v2.client.world.WorldMeshRenderer;
-import com.github.mcmodderanchor.simplebedrockmodel.v2.client.world.WorldMeshGroup;
-import com.github.mcmodderanchor.simplebedrockmodel.v2.client.world.MeshRenderable;
-import com.github.mcmodderanchor.simplebedrockmodel.v2.client.world.GeometryCollector;
-import com.github.mcmodderanchor.simplebedrockmodel.v2.client.world.WorldMeshStrategy;
+import com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh.world.WorldMeshRenderer;
+import com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh.world.WorldMeshGroup;
+import com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh.world.MeshRenderable;
+import com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh.capture.GeometryCollector;
+import com.github.mcmodderanchor.simplebedrockmodel.v2.client.mesh.world.WorldMeshStrategy;
 import com.github.mcmodderanchor.simplebedrockmodel.v2.common.model.runtime.TreeModelInstance;
 import com.github.mcmodderanchor.simplebedrockmodel.v2.common.model.tree.TreeBedrockModel;
 import com.github.mcmodderanchor.simplebedrockmodel.v2.resource.BedrockModelResources;

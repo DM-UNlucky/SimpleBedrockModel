@@ -1,5 +1,7 @@
 # 世界网格渲染调用链与资源归属
 
+2026-10-07 结构更新：所有类型迁移到 `v2.client.mesh`；GPU 上传/回收归 `WorldMeshBuffers`，材质 draw/清理归世界与临时网格共用的 `MeshBatchRenderer`。包结构与接口见 [静态网格 API](static-mesh-api.md)，旧原型入口名称直接删除，GPU 句柄及辅助方法保持 public。
+
 更新日期：2026-09-24。接入方法见 [渲染组 API](D:/Minecraft/Dev/SimpleBedrockModel/docs/world-mesh-rendering.md)。
 
 ## 主链
@@ -98,7 +100,7 @@ InstanceMeshBatches 为已捕获的几何排队上传。SectionMeshBatches 的 p
 
 ## 上传与绘制
 
-WorldMeshRenderer.submit 接收内部 MeshSink、材质和光照语义，直接计算包围盒并建立 ShardHandle。
+WorldMeshBuffers.submit 接收内部 MeshSink、材质和光照语义，直接计算包围盒并建立 WorldMeshPart。
 上传由原版 ChunkRenderDispatcher 队列执行。未完成上传的网格不参与绘制；策略负责等待和换版。
 
 绘制阶段按材质共享 shader 参数，逐实例更新 ModelView 矩阵并 draw。
@@ -113,7 +115,7 @@ section 的局部光照更新通过独立流上传脏范围，不改几何缓冲
 | WorldMeshGroup.Entry | 对象、适配器、上次属性与脏版本 | 避免重复收集并判断更新，不做方法转发 |
 | GeometryCache.Entry | key、CPU 几何、共享引用数、INSTANCE GPU 网格 | 同 key 共享几何，确定缓存何时可释放 |
 | 策略的 Resident／Batch／Version | 实例位置、批次成员、active/pending、光照范围 | 两种绘制策略真实存在的组织和换版状态 |
-| ShardHandle | VBO、材质、包围盒、上传状态，SECTION 所需的光照流 | GPU 资源的内部所有权与异步上传状态 |
+| WorldMeshPart | VBO、材质、包围盒、上传状态，SECTION 所需的光照流 | GPU 资源的内部所有权与异步上传状态 |
 | WorldMeshMetrics | 累计计数、最近一帧与阶段间隔采样 | 从绘制流程分离统计状态，按需生成 WorldMeshStats 快照 |
 
 共享引用由 GeometryCache.Entry 计数。

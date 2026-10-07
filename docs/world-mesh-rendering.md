@@ -1,5 +1,7 @@
 # 世界网格渲染组：分工、API 与策略覆盖
 
+2026-10-07 结构更新：所有类型迁移到 `v2.client.mesh`；GPU 上传/回收归 `WorldMeshBuffers`，材质 draw/清理归世界与临时网格共用的 `MeshBatchRenderer`。包结构与接口见 [静态网格 API](static-mesh-api.md)，旧原型入口名称直接删除，GPU 句柄及辅助方法保持 public。
+
 更新日期：2026-09-24。本文描述当前渲染组接口。
 
 ## 分工
@@ -92,7 +94,7 @@ ExampleStressMeshGroup 的测试对象直接实现接口，needsUpdate=false，�
 
 ## 几何收集
 
-GeometryCollector 由库创建并传入 collectGeometry，只在这次回调内使用，不能自行构造或保存供以后写入。
+标准登记入口由库创建 GeometryCollector 并传入 collectGeometry；这份收集器属于当前捕获。构造器、snapshot 和 MeshSink 保持 public，接入方也可以直接使用 CPU 捕获工具。
 
 - `collector.blockModel(modelId, texture, facing)`：按资源 ID 获取当前 SBM 树模型，绑定姿势、局部平移 `(0.5,0,0.5)`、应用朝向；自动收集 QUADS 与 TRIANGLES，并把固定发光图元送往无方向光的独立材质；资源暂缺返回 false。
 - `collector.buffer(material, mode)`：获取 VertexConsumer，供自定义模型直接写顶点；同材质／拓扑的多次写入自动合并。INSTANCE 中一个 pass 的 UV2 须全部为 0 或全部固定非零；混合时须使用双材质重载。
@@ -197,10 +199,10 @@ GPU 上传仍经由原版 ChunkRenderDispatcher。已排队的缓冲在完成前
 - GeometryCache：按共享 key 保存捕获任务及结果，不调用业务对象；逐实例模式共享 GPU 网格，最后一个库内引用释放后淘汰。
 - InstanceMeshBatches：共享网格、实例位置与光照、active/pending 换版和限额重试。
 - SectionMeshBatches：section＋材质＋拓扑分组、重建队列、版本独立的成员光照范围。
-- WorldMeshRenderer：上传队列、缓冲池、统一世界绘制和统计。
+- WorldMeshRenderer：世界阶段调度、剔除与统计；WorldMeshBuffers 管上传、缓冲池与光照流，MeshBatchRenderer 执行统一绘制。
 - WorldMeshMetrics：内部累计计数与帧采样；`WorldMeshRenderer.stats()` 从中构造不可变的 `WorldMeshStats` 快照。
 
-ShardHandle、MeshLighting 和原始 submit 是内部实现。共享计数由几何缓存维护。
+WorldMeshPart、MeshLighting 和原始 submit 是内部实现。共享计数由几何缓存维护。
 局部光照仍采用独立 4 B/顶点流，合并相邻／重叠脏区间，并在可见绘制前上传；调用方只需修改自身光照并 markDirty，或通过 needsUpdate 和属性方法被动报告变化。
 便捷捕获将发光图元拆成独立 RenderType，其 shader 不按法线方向调暗；SECTION 的纯发光批次直接读取固定 UV2，不分配独立光照流。普通顶点的局部光照范围仍由模板识别，不要求调用方记录顶点编号。
 

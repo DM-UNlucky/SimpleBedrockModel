@@ -1,5 +1,7 @@
 # Section 合批与光照压测
 
+2026-10-07 结构更新：所有类型迁移到 `v2.client.mesh`；GPU 上传/回收归 `WorldMeshBuffers`，材质 draw/清理归世界与临时网格共用的 `MeshBatchRenderer`。包结构与接口见 [静态网格 API](static-mesh-api.md)，旧原型入口名称直接删除，GPU 句柄及辅助方法保持 public。
+
 世界网格支持共享几何的逐实例绘制，以及按 `16×16×16` section 合并绘制。
 两条路径使用同一 `WorldMeshRenderer`、材质和 `AFTER_BLOCK_ENTITIES` 绘制阶段。
 默认仍走逐实例路径，切换命令同时作用于示例方块实体和静态压力测试挂具。

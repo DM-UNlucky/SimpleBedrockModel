@@ -74,6 +74,8 @@ dependencies {
 }
 ```
 
+The unpublished static mesh API and implementation boundaries are documented in [Static mesh API](docs/static-mesh-api.md). World object integration is described in [World mesh groups](docs/world-mesh-rendering.md).
+
 ## 📝 License
 
 This project is licensed under the **LGPL-3.0 License** - see the [LICENSE](LICENSE) file for details.  
