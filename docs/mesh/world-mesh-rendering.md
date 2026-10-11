@@ -10,18 +10,23 @@
 WorldMeshGroup<MyBlockEntity> group = WorldMeshRenderer.createGroup(
         "mymod:decorations", WorldMeshStrategy.SECTION);
 MeshRenderableAdapter<MyBlockEntity> adapter = new MeshRenderableAdapter<>() {
+    
     public boolean isValid(MyBlockEntity entity) {
         return !entity.isRemoved() && entity.getLevel() != null;
     }
+    
     public Vec3 origin(MyBlockEntity entity) {
         return Vec3.atLowerCornerOf(entity.getBlockPos());
     }
+    
     public int packedLight(MyBlockEntity entity) {
         return LevelRenderer.getLightColor(entity.getLevel(), entity.getBlockPos());
     }
+    
     public Object geometryKey(MyBlockEntity entity) {
         return GeometryCollector.blockModelKey(modelId, texture, Direction.NORTH);
     }
+    
     public boolean collectGeometry(MyBlockEntity entity, GeometryCollector collector) {
         return collector.blockModel(modelId, texture, Direction.NORTH);
     }
